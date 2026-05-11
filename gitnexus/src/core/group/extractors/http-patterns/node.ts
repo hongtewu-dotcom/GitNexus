@@ -148,6 +148,23 @@ const AXIOS_OBJECT_SPEC: PatternSpec<Record<string, never>> = {
   `,
 };
 
+// ─── Consumer: chain-style wrapper().chain().METHOD() ─────────────────
+// Matches patterns like `FlightNetwork(path).params(x).POST()` where
+// the terminator method name is a well-known HTTP verb in UPPER-CASE.
+// The tree-sitter query captures the outermost call_expression whose
+// function is a member_expression with property matching the verb.
+// The actual path is resolved programmatically by walking the chain
+// inward to find the root call that receives a string/template literal.
+const CHAIN_STYLE_CONSUMER_SPEC: PatternSpec<Record<string, never>> = {
+  meta: {},
+  query: `
+    (call_expression
+      function: (member_expression
+        property: (property_identifier) @http_method (#match? @http_method "^(GET|POST|PUT|DELETE|PATCH)$"))
+      arguments: (arguments)) @chain_call
+  `,
+};
+
 interface NodePatternBundle {
   controller: CompiledPatterns<Record<string, never>>;
   methodDecorator: CompiledPatterns<Record<string, never>>;
@@ -158,6 +175,7 @@ interface NodePatternBundle {
   jqueryShorthand: CompiledPatterns<Record<string, never>>;
   jqueryAjax: CompiledPatterns<Record<string, never>>;
   axiosObject: CompiledPatterns<Record<string, never>>;
+  chainStyle: CompiledPatterns<Record<string, never>>;
 }
 
 function compileBundle(language: unknown, name: string): NodePatternBundle {
@@ -177,6 +195,7 @@ function compileBundle(language: unknown, name: string): NodePatternBundle {
     jqueryShorthand: mk(JQUERY_SHORTHAND_SPEC, 'jquery-shorthand'),
     jqueryAjax: mk(JQUERY_AJAX_SPEC, 'jquery-ajax'),
     axiosObject: mk(AXIOS_OBJECT_SPEC, 'axios-object'),
+    chainStyle: mk(CHAIN_STYLE_CONSUMER_SPEC, 'chain-style'),
   };
 }
 
@@ -480,7 +499,174 @@ function scanBundle(bundle: NodePatternBundle, tree: Parser.Tree): HttpDetection
     });
   }
 
+  // Consumer: chain-style Wrapper(path).chain().METHOD(). Walk inward
+  // from the outermost `.METHOD()` call to find the root call that
+  // receives a string/template_string literal as its first argument.
+  for (const match of runCompiledPatterns(bundle.chainStyle, tree)) {
+    const methodNode = match.captures.http_method;
+    const chainCallNode = match.captures.chain_call;
+    if (!methodNode || !chainCallNode) continue;
+    const method = methodNode.text.toUpperCase();
+
+    // Walk the member_expression chain inward: each link is
+    // call_expression → member_expression → object (next call_expression)
+    // until we reach a call_expression whose function is an identifier.
+    const path = resolveChainPath(chainCallNode);
+    if (path === null) continue;
+
+    out.push({
+      role: 'consumer',
+      framework: 'chain',
+      method,
+      path,
+      name: null,
+      confidence: 0.7,
+    });
+  }
+
   return out;
+}
+
+/**
+ * Walk a chain-style call expression inward to find the root call that
+ * has a string/template_string as its first argument. The structure is:
+ *
+ *   call(.POST args)
+ *     member_expression
+ *       object: call(.params args)
+ *         member_expression
+ *           object: call(FlightNetwork args=(path))  ← root
+ *             function: identifier
+ *             arguments: (string @path)
+ *
+ * When the root call's first argument is an identifier (variable reference),
+ * we do a simple intra-scope lookup: walk backward through sibling statements
+ * to find `const/let/var <name> = '...'` and extract the literal value.
+ *
+ * For template strings like `/flightpricecheck${FTK_Request_Common_Path}`,
+ * we extract only the leading static segment before the first interpolation.
+ *
+ * We traverse at most 10 levels deep to avoid infinite loops.
+ */
+function resolveChainPath(outerCall: Parser.SyntaxNode): string | null {
+  let cur: Parser.SyntaxNode | null = outerCall;
+  for (let depth = 0; depth < 10 && cur; depth++) {
+    // The function of a chain call is a member_expression
+    const fn = cur.childForFieldName('function');
+    if (!fn) return null;
+
+    if (fn.type === 'member_expression') {
+      // object of the member_expression is the next link in the chain
+      const obj = fn.childForFieldName('object');
+      if (!obj) return null;
+      if (obj.type === 'call_expression') {
+        // Check if this call has a string literal first arg (it's the root)
+        const resolved = resolveRootCallPath(obj);
+        if (resolved !== null) return resolved;
+        // Not the root yet — continue traversal
+        cur = obj;
+        continue;
+      }
+      // object is something else (identifier = direct member call, not a chain)
+      return null;
+    }
+
+    // function is an identifier: this is the root call, check its first arg
+    if (fn.type === 'identifier') {
+      return resolveRootCallPath(cur);
+    }
+
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Given a call_expression node, try to resolve a path string from its first
+ * argument. Handles: string literal, template_string, or identifier (variable
+ * reference with intra-scope lookup).
+ */
+function resolveRootCallPath(callNode: Parser.SyntaxNode): string | null {
+  const args = callNode.childForFieldName('arguments');
+  if (!args || args.namedChildCount === 0) return null;
+  const firstArg = args.namedChild(0);
+  if (!firstArg) return null;
+
+  if (firstArg.type === 'string') {
+    return unquoteLiteral(firstArg.text);
+  }
+  if (firstArg.type === 'template_string') {
+    return extractTemplateLiteral(firstArg);
+  }
+  // Variable reference — try intra-scope lookup
+  if (firstArg.type === 'identifier') {
+    return resolveVariableInScope(firstArg.text, callNode);
+  }
+  return null;
+}
+
+/**
+ * Extract the leading static portion of a template_string node.
+ * For `` `/flightpricecheck${suffix}` ``, returns "/flightpricecheck".
+ * For a fully-static template (no interpolation), returns the whole string.
+ */
+function extractTemplateLiteral(node: Parser.SyntaxNode): string | null {
+  // A template_string's children alternate between string fragments and
+  // template_substitution nodes. The first child after ` is a fragment.
+  const text = node.text;
+  // Strip backticks
+  const inner = text.slice(1, -1);
+  // Find first ${ — take everything before it
+  const interpIdx = inner.indexOf('${');
+  if (interpIdx === -1) {
+    // No interpolation — fully static
+    return inner || null;
+  }
+  const prefix = inner.slice(0, interpIdx);
+  return prefix || null;
+}
+
+/**
+ * Simple intra-scope variable resolution: given `varName` used in a statement
+ * at `usageNode`, walk backward through preceding sibling statements in the
+ * same block to find `const/let/var varName = <literal>` and return the value.
+ * Only resolves one level (no transitive lookups).
+ */
+function resolveVariableInScope(varName: string, usageNode: Parser.SyntaxNode): string | null {
+  // Find the statement containing usageNode (walk up to statement_block / program child)
+  let stmtNode: Parser.SyntaxNode | null = usageNode;
+  while (stmtNode && stmtNode.parent && stmtNode.parent.type !== 'statement_block' && stmtNode.parent.type !== 'program' && stmtNode.parent.type !== 'class_body') {
+    stmtNode = stmtNode.parent;
+  }
+  if (!stmtNode || !stmtNode.parent) return null;
+
+  const block = stmtNode.parent;
+  // Walk backward through children of the block
+  for (let i = 0; i < block.namedChildCount; i++) {
+    const child = block.namedChild(i);
+    if (!child) continue;
+    if (child.id === stmtNode.id) break; // reached our statement, stop looking
+    // Look for variable declarations: lexical_declaration or variable_declaration
+    if (child.type === 'lexical_declaration' || child.type === 'variable_declaration') {
+      // Each declaration can have multiple declarators
+      for (let j = 0; j < child.namedChildCount; j++) {
+        const declarator = child.namedChild(j);
+        if (!declarator || declarator.type !== 'variable_declarator') continue;
+        const nameNode = declarator.childForFieldName('name');
+        const valueNode = declarator.childForFieldName('value');
+        if (!nameNode || !valueNode) continue;
+        if (nameNode.text !== varName) continue;
+        // Found the declaration — extract value
+        if (valueNode.type === 'string') {
+          return unquoteLiteral(valueNode.text);
+        }
+        if (valueNode.type === 'template_string') {
+          return extractTemplateLiteral(valueNode);
+        }
+      }
+    }
+  }
+  return null;
 }
 
 export const JAVASCRIPT_HTTP_PLUGIN: HttpLanguagePlugin = {

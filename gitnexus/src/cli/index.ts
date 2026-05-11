@@ -61,6 +61,10 @@ program
     'Register this repo even if another path already uses the same --name alias. ' +
       'Leaves `-r <name>` ambiguous for the two paths; use -r <path> to disambiguate.',
   )
+  .option(
+    '--fast',
+    'Skip community detection and process extraction (keeps MRO). Faster analysis for large repos.',
+  )
   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
   .option(
     '--max-file-size <kb>',

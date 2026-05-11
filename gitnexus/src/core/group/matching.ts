@@ -118,15 +118,97 @@ function findMatchingKeys(contractId: string, index: Map<string, StoredContract[
   const normalized = normalizeContractId(contractId);
   if (index.has(normalized)) return [normalized];
 
+  // Consumer with method=* matches any provider method for the same path
   if (normalized.startsWith('http::*::')) {
     const pathPart = normalized.substring('http::*::'.length);
-    const matches: string[] = [];
-    for (const key of index.keys()) {
-      if (key.startsWith('http::') && key.endsWith(`::${pathPart}`)) {
-        matches.push(key);
+    if (pathPart.length > 0) {
+      const matches: string[] = [];
+      for (const key of index.keys()) {
+        if (key.startsWith('http::') && key.endsWith(`::${pathPart}`)) {
+          matches.push(key);
+        }
+      }
+      return matches;
+    }
+  }
+
+  // Consumer with a specific method also matches provider with method=* (e.g. bare @RequestMapping)
+  if (normalized.startsWith('http::')) {
+    const parts = normalized.split('::');
+    if (parts.length >= 3 && parts[1] !== '*') {
+      const pathPart = parts.slice(2).join('::');
+      if (pathPart.length > 0) {
+        const wildcardKey = `http::*::${pathPart}`;
+        if (index.has(wildcardKey)) return [wildcardKey];
       }
     }
-    return matches;
+  }
+
+  // HTTP prefix matching (forward): consumer path `/flightpricecheck` matches
+  // provider `/flightpricecheck/{param}/{param}/{param}`. The consumer path
+  // (from template string prefix extraction) may be shorter than the provider's
+  // full parameterized path.
+  if (normalized.startsWith('http::')) {
+    const parts = normalized.split('::');
+    if (parts.length >= 3) {
+      const method = parts[1];
+      const consumerPath = parts.slice(2).join('::');
+      // Only do prefix matching for non-trivial paths (at least 2 chars after /)
+      if (consumerPath.length > 2) {
+        const prefixMatches: string[] = [];
+        for (const key of index.keys()) {
+          if (!key.startsWith('http::')) continue;
+          const keyParts = key.split('::');
+          if (keyParts.length < 3) continue;
+          const providerMethod = keyParts[1];
+          const providerPath = keyParts.slice(2).join('::');
+          // Method must be compatible (same, or either is *)
+          if (method !== '*' && providerMethod !== '*' && method !== providerMethod) continue;
+          // Provider path must start with consumer path + "/" or "/{param}"
+          if (providerPath.startsWith(consumerPath + '/') || providerPath.startsWith(consumerPath + '/{param}')) {
+            prefixMatches.push(key);
+          }
+        }
+        if (prefixMatches.length > 0) return prefixMatches;
+      }
+    }
+  }
+
+  // HTTP prefix matching (reverse): consumer path `/m/auth/login` matches
+  // a gateway wildcard provider registered as `/m/auth` (from Shepherd
+  // `/**` routes). The provider path is a prefix of the consumer path.
+  // This is lower-priority than exact or forward-prefix matches above.
+  if (normalized.startsWith('http::')) {
+    const parts = normalized.split('::');
+    if (parts.length >= 3) {
+      const method = parts[1];
+      const consumerPath = parts.slice(2).join('::');
+      if (consumerPath.length > 2) {
+        const reverseMatches: string[] = [];
+        for (const key of index.keys()) {
+          if (!key.startsWith('http::')) continue;
+          const keyParts = key.split('::');
+          if (keyParts.length < 3) continue;
+          const providerMethod = keyParts[1];
+          const providerPath = keyParts.slice(2).join('::');
+          // Skip empty or root-only provider paths (e.g. `http::*::` from
+          // normalized `http::*::/`) — they would match every consumer path
+          // and produce false positives.
+          if (providerPath.length < 2) continue;
+          if (method !== '*' && providerMethod !== '*' && method !== providerMethod) continue;
+          // Consumer path must start with provider path + "/"
+          // (provider is a prefix — from Shepherd wildcard routes)
+          if (consumerPath.startsWith(providerPath + '/')) {
+            reverseMatches.push(key);
+          }
+        }
+        // Pick the longest (most specific) prefix match to avoid overly broad `/m` matching
+        if (reverseMatches.length > 0) {
+          reverseMatches.sort((a, b) => b.length - a.length);
+          return [reverseMatches[0]];
+        }
+      }
+    }
   }
 
   if (normalized.startsWith('thrift::')) {
@@ -198,6 +280,9 @@ export function runExactMatch(
     const allMatchingProviders = matchingKeys.flatMap((k) => index.get(k) || []);
     for (const provider of allMatchingProviders) {
       if (provider.repo === consumer.repo) {
+        if (matchingConfig?.cross_repo_only) {
+          continue;
+        }
         if (!provider.service || !consumer.service || provider.service === consumer.service) {
           continue;
         }
@@ -245,6 +330,7 @@ export function runExactMatch(
 export function runWildcardMatch(
   unmatched: StoredContract[],
   providerIndex: Map<string, StoredContract[]>,
+  matchingConfig?: MatchingConfig,
 ): WildcardMatchResult {
   const wildcardConsumers = unmatched.filter(
     (c) => c.role === 'consumer' && isServiceWildcard(c.contractId),
@@ -291,6 +377,9 @@ export function runWildcardMatch(
     for (const provider of candidateProviders) {
       // Skip same-repo same-service (same logic as runExactMatch)
       if (provider.repo === consumer.repo) {
+        if (matchingConfig?.cross_repo_only) {
+          continue;
+        }
         if (!provider.service || !consumer.service || provider.service === consumer.service) {
           continue;
         }

@@ -2,6 +2,30 @@ export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custo
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
+/**
+ * Scope filter: restrict cross-links from a repo to only those reachable
+ * from specified entry-point methods via intra-repo BFS.
+ *
+ * Example in group.yaml:
+ *   scopes:
+ *     booking/service:
+ *       entry_points:
+ *         - method: secondCheck
+ *           file: booking-server/src/main/java/.../SecondCheckThriftServer.java
+ *       max_depth: 15
+ */
+export interface RepoScope {
+  entry_points: EntryPoint[];
+  /** BFS max depth (default: 15). */
+  max_depth?: number;
+}
+
+export interface EntryPoint {
+  method: string;
+  /** Optional file path filter — limits to a specific entry when multiple methods share the same name. */
+  file?: string;
+}
+
 export interface GroupConfig {
   version: number;
   name: string;
@@ -11,6 +35,8 @@ export interface GroupConfig {
   packages: Record<string, Record<string, string>>;
   detect: DetectConfig;
   matching: MatchingConfig;
+  /** Per-repo scope filters: only emit cross-links reachable from declared entry points. */
+  scopes?: Record<string, RepoScope>;
 }
 
 export interface GroupManifestLink {
@@ -30,6 +56,37 @@ export interface DetectConfig {
   embedding_fallback: boolean;
   includes: boolean;
   workspace_deps: boolean;
+  /** External IO boundary detection (HTTP/Socket calls to external systems). */
+  external_io: boolean;
+  /** HTTP consumer detection (FeignClient, RestTemplate, WebClient). */
+  http_consumers: boolean;
+  /** Post-extraction noise filtering (FacebookService, generic interfaces, dedup). */
+  post_filter: boolean;
+  /** Crane distributed task scheduling annotation scanning (@Crane("task-name")). */
+  crane: boolean;
+  /** Squirrel Redis cluster dependency detection (shared cache coupling). */
+  squirrel: boolean;
+  /** Shepherd API gateway route resolution (fetch routes from gateway config). */
+  shepherd?: ShepherdDetectConfig | boolean;
+}
+
+/**
+ * Shepherd gateway detection config. When specified as `true` in group.yaml,
+ * defaults are used. When specified as an object, allows fine-grained control.
+ */
+export interface ShepherdDetectConfig {
+  /** Shepherd API group name (e.g. 'flight-m'). Required. */
+  group: string;
+  /** Repo path in config.repos representing the gateway (e.g. 'api/gateway'). */
+  gateway_repo?: string;
+  /** SSO cookie value for Shepherd API authentication. */
+  cookie?: string;
+  /** Path to file containing SSO cookie. */
+  cookie_file?: string;
+  /** Path to pre-fetched XML cache file (for offline/CI usage). */
+  cache_file?: string;
+  /** Cache TTL in seconds (default: 3600). */
+  cache_ttl?: number;
 }
 
 export interface MatchingConfig {
@@ -54,6 +111,14 @@ export interface MatchingConfig {
    * @default false
    */
   exclude_links_param_only_paths?: boolean;
+  /**
+   * When `true`, only generate cross-links between different repositories.
+   * Intra-repo links (same repo, different service boundaries in monorepos)
+   * will be excluded. Useful when you only care about the inter-service
+   * topology across separate Git repositories.
+   * @default false
+   */
+  cross_repo_only?: boolean;
 }
 
 export interface SymbolRef {

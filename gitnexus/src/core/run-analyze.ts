@@ -96,6 +96,11 @@ export interface AnalyzeOptions {
   /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
   skipSkills?: boolean;
   /**
+   * Fast mode: skip communities and processes but keep MRO.
+   * Maps to PipelineOptions.fastMode.
+   */
+  fast?: boolean;
+  /**
    * User-provided alias for the registry `name` (#829). When set,
    * forwarded to `registerRepo` so the indexed repo is stored under
    * this alias instead of the path-derived basename.
@@ -366,7 +371,7 @@ export async function runFullAnalysis(
         : p.message || phaseLabel;
       progress(p.phase, scaled, message);
     },
-    { parseCache },
+    { parseCache, fastMode: options.fast },
   );
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────
