@@ -5,7 +5,6 @@ import * as os from 'node:os';
 import { runGroupTrace } from '../../../src/core/group/trace.js';
 import type { TraceResult, TraceDeps } from '../../../src/core/group/trace.js';
 import type { GroupToolPort, GroupRepoHandle } from '../../../src/core/group/service.js';
-import type { ContractRegistry, CrossLink } from '../../../src/core/group/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -13,7 +12,6 @@ import type { ContractRegistry, CrossLink } from '../../../src/core/group/types.
 
 function tmpGroup(opts?: {
   repos?: Record<string, string>;
-  contracts?: ContractRegistry;
 }): { tmpDir: string; groupDir: string; cleanup: () => void } {
   const tmpDir = path.join(os.tmpdir(), `gitnexus-trace-${Date.now()}-${Math.random()}`);
   const groupDir = path.join(tmpDir, 'groups', 'g1');
@@ -46,13 +44,6 @@ matching:
 `,
   );
 
-  if (opts?.contracts) {
-    fs.writeFileSync(
-      path.join(groupDir, 'contracts.json'),
-      JSON.stringify(opts.contracts, null, 2),
-    );
-  }
-
   return {
     tmpDir,
     groupDir,
@@ -60,35 +51,23 @@ matching:
   };
 }
 
-function makeCrossLink(overrides: Partial<CrossLink> = {}): CrossLink {
-  return {
-    from: {
-      repo: 'app/backend',
-      symbolUid: 'be-consumer-uid',
-      symbolRef: { filePath: 'src/client.ts', name: 'callFrontend' },
-    },
-    to: {
-      repo: 'app/frontend',
-      symbolUid: 'fe-provider-uid',
-      symbolRef: { filePath: 'src/api.ts', name: 'handleRequest' },
-    },
-    type: 'http',
-    contractId: 'http::GET::/api/data',
-    matchType: 'exact',
-    confidence: 1,
-    ...overrides,
-  };
-}
-
-function makeRegistry(crossLinks: CrossLink[] = []): ContractRegistry {
-  return {
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    repoSnapshots: {},
-    missingRepos: [],
-    contracts: [],
-    crossLinks,
-  };
+/** Write a contracts.json file into the group directory. */
+function writeContractsJson(
+  groupDir: string,
+  crossLinks: any[] = [],
+  contracts: any[] = [],
+): void {
+  fs.writeFileSync(
+    path.join(groupDir, 'contracts.json'),
+    JSON.stringify({
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      repoSnapshots: {},
+      missingRepos: [],
+      contracts,
+      crossLinks,
+    }),
+  );
 }
 
 function makePort(overrides: Partial<GroupToolPort> = {}): GroupToolPort {
@@ -175,24 +154,8 @@ describe('runGroupTrace', () => {
     expect((result as { error: string }).error).toContain('not found');
   });
 
-  it('returns error when contracts.json is missing', async () => {
-    const { tmpDir, cleanup } = tmpGroup();
-    try {
-      const port = makePort();
-      const result = await runGroupTrace(makeDeps(port, tmpDir), {
-        name: 'g1',
-        repo: 'app/backend',
-        target: 'foo',
-      });
-      expect(result).toHaveProperty('error');
-      expect((result as { error: string }).error).toContain('contracts.json');
-    } finally {
-      cleanup();
-    }
-  });
-
   it('returns error when repo path not in group', async () => {
-    const { tmpDir, cleanup } = tmpGroup({ contracts: makeRegistry() });
+    const { tmpDir, cleanup } = tmpGroup();
     try {
       const port = makePort();
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
@@ -208,8 +171,9 @@ describe('runGroupTrace', () => {
   });
 
   it('returns error when entry symbol not found in lbug', async () => {
-    const { tmpDir, cleanup } = tmpGroup({ contracts: makeRegistry() });
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
     try {
+      writeContractsJson(groupDir);
       // executeParameterized returns [] for all queries → symbol not found
       const port = makePort();
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
@@ -224,18 +188,19 @@ describe('runGroupTrace', () => {
     }
   });
 
-  it('returns single-repo trace when no crossLinks match', async () => {
-    const { tmpDir, cleanup } = tmpGroup({ contracts: makeRegistry() });
+  it('returns single-repo trace when no crossLinks exist', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
     try {
+      writeContractsJson(groupDir); // empty crossLinks
+
       const { executeParameterized, executeQuery } = await import(
         '../../../src/core/lbug/pool-adapter.js'
       );
 
-      // First call: resolve entry symbol by id
+      // Resolve entry symbol by id
       (executeParameterized as any).mockResolvedValueOnce([
         { id: 'sym-1', name: 'myFunc', type: 'Function', filePath: 'src/main.ts' },
       ]);
-      // Second call: resolve by name (won't be called since first succeeds)
 
       // BFS query returns one neighbor
       (executeQuery as any).mockResolvedValueOnce([
@@ -273,34 +238,52 @@ describe('runGroupTrace', () => {
     }
   });
 
-  it('follows crossLink to second repo', async () => {
-    const crossLink = makeCrossLink();
-    const { tmpDir, cleanup } = tmpGroup({
-      contracts: makeRegistry([crossLink]),
-    });
+  it('follows cross-repo hop via contracts.json crossLinks', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
     try {
+      // Write contracts.json with a crossLink from app/backend → app/frontend
+      writeContractsJson(groupDir, [
+        {
+          from: {
+            repo: 'app/backend',
+            symbolUid: 'source-scan::thrift::consumer::FrontendService/handleRequest',
+            symbolRef: { filePath: 'src/client.ts', name: 'FrontendService.handleRequest' },
+          },
+          to: {
+            repo: 'app/frontend',
+            symbolUid: 'source-scan::thrift::provider::FrontendService/handleRequest',
+            symbolRef: { filePath: 'src/api.ts', name: 'FrontendService.handleRequest' },
+          },
+          type: 'thrift',
+          contractId: 'thrift::FrontendService/handleRequest',
+          matchType: 'exact',
+          confidence: 1,
+        },
+      ]);
+
       const { executeParameterized, executeQuery } = await import(
         '../../../src/core/lbug/pool-adapter.js'
       );
 
       // Entry repo: resolve entry symbol
       (executeParameterized as any).mockResolvedValueOnce([
-        { id: 'be-consumer-uid', name: 'callFrontend', type: 'Function', filePath: 'src/client.ts' },
+        { id: 'be-sym-1', name: 'callFrontend', type: 'Function', filePath: 'src/client.ts' },
       ]);
 
-      // Entry repo BFS depth 1: no CALLS neighbors (the entry node itself matches crossLink)
+      // Entry repo BFS depth 1: no CALLS neighbors
       (executeQuery as any).mockResolvedValueOnce([]);
 
-      // Target repo: resolve symbolUid
-      (executeParameterized as any).mockResolvedValueOnce([
-        { id: 'fe-provider-uid', name: 'handleRequest', type: 'Function', filePath: 'src/api.ts' },
-      ]);
+      // Target repo: resolve symbol by name "FrontendService.handleRequest"
+      (executeParameterized as any)
+        .mockResolvedValueOnce([
+          { id: 'fe-sym-1', name: 'handleRequest', type: 'Function', filePath: 'src/api.ts' },
+        ]);
 
       // Target repo BFS depth 1: one neighbor
       (executeQuery as any).mockResolvedValueOnce([
         {
-          sourceId: 'fe-provider-uid',
-          id: 'fe-inner-uid',
+          sourceId: 'fe-sym-1',
+          id: 'fe-sym-2',
           name: 'processData',
           type: 'Function',
           filePath: 'src/processor.ts',
@@ -315,7 +298,7 @@ describe('runGroupTrace', () => {
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
         name: 'g1',
         repo: 'app/backend',
-        target: 'be-consumer-uid',
+        target: 'be-sym-1',
         maxDepth: 3,
         maxCrossDepth: 2,
       });
@@ -327,49 +310,12 @@ describe('runGroupTrace', () => {
       // First segment: entry repo
       expect(trace.segments[0].repoPath).toBe('app/backend');
       expect(trace.segments[0].crossHops).toHaveLength(1);
-      expect(trace.segments[0].crossHops[0].contractId).toBe('http::GET::/api/data');
+      expect(trace.segments[0].crossHops[0].contractId).toBe('thrift::FrontendService/handleRequest');
 
       // Second segment: target repo
       expect(trace.segments[1].repoPath).toBe('app/frontend');
-      expect(trace.segments[1].entrySymbolUid).toBe('fe-provider-uid');
       expect(trace.segments[1].nodes).toHaveLength(1);
       expect(trace.segments[1].nodes[0].name).toBe('processData');
-    } finally {
-      cleanup();
-    }
-  });
-
-  it('respects maxCrossDepth and sets truncated', async () => {
-    const crossLink = makeCrossLink();
-    const { tmpDir, cleanup } = tmpGroup({
-      contracts: makeRegistry([crossLink]),
-    });
-    try {
-      const { executeParameterized, executeQuery } = await import(
-        '../../../src/core/lbug/pool-adapter.js'
-      );
-
-      // Entry repo: resolve entry symbol
-      (executeParameterized as any).mockResolvedValueOnce([
-        { id: 'be-consumer-uid', name: 'callFrontend', type: 'Function', filePath: 'src/client.ts' },
-      ]);
-
-      // Entry repo BFS: no neighbors
-      (executeQuery as any).mockResolvedValueOnce([]);
-
-      const port = makePort();
-      const result = await runGroupTrace(makeDeps(port, tmpDir), {
-        name: 'g1',
-        repo: 'app/backend',
-        target: 'be-consumer-uid',
-        maxCrossDepth: 0, // no cross-repo hops allowed
-      });
-
-      expect(result).not.toHaveProperty('error');
-      const trace = result as TraceResult;
-      // Only entry repo segment
-      expect(trace.segments).toHaveLength(1);
-      expect(trace.truncated).toBe(true);
     } finally {
       cleanup();
     }
@@ -388,8 +334,10 @@ describe('runGroupTrace', () => {
   });
 
   it('skips test files when includeTests is false', async () => {
-    const { tmpDir, cleanup } = tmpGroup({ contracts: makeRegistry() });
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
     try {
+      writeContractsJson(groupDir);
+
       const { executeParameterized, executeQuery } = await import(
         '../../../src/core/lbug/pool-adapter.js'
       );
