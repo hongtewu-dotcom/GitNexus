@@ -2,30 +2,6 @@ export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custo
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
-/**
- * Scope filter: restrict cross-links from a repo to only those reachable
- * from specified entry-point methods via intra-repo BFS.
- *
- * Example in group.yaml:
- *   scopes:
- *     booking/service:
- *       entry_points:
- *         - method: secondCheck
- *           file: booking-server/src/main/java/.../SecondCheckThriftServer.java
- *       max_depth: 15
- */
-export interface RepoScope {
-  entry_points: EntryPoint[];
-  /** BFS max depth (default: 15). */
-  max_depth?: number;
-}
-
-export interface EntryPoint {
-  method: string;
-  /** Optional file path filter — limits to a specific entry when multiple methods share the same name. */
-  file?: string;
-}
-
 export interface GroupConfig {
   version: number;
   name: string;
@@ -35,8 +11,6 @@ export interface GroupConfig {
   packages: Record<string, Record<string, string>>;
   detect: DetectConfig;
   matching: MatchingConfig;
-  /** Per-repo scope filters: only emit cross-links reachable from declared entry points. */
-  scopes?: Record<string, RepoScope>;
 }
 
 export interface GroupManifestLink {

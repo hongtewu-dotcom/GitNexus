@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import type { GroupConfig, GroupManifestLink, ContractType, ContractRole, RepoScope, EntryPoint } from './types.js';
+import type { GroupConfig, GroupManifestLink, ContractType, ContractRole } from './types.js';
 
 const _require = createRequire(import.meta.url);
 const yaml = _require('js-yaml') as typeof import('js-yaml');
@@ -86,36 +86,6 @@ export function parseGroupConfig(yamlContent: string): GroupConfig {
   const matching = { ...DEFAULT_MATCHING, ...((raw.matching as object) || {}) };
   const packages = (raw.packages as Record<string, Record<string, string>>) || {};
 
-  // Parse scopes
-  let scopes: Record<string, RepoScope> | undefined;
-  if (raw.scopes && typeof raw.scopes === 'object' && !Array.isArray(raw.scopes)) {
-    scopes = {};
-    for (const [repoPath, scopeRaw] of Object.entries(raw.scopes as Record<string, unknown>)) {
-      if (!repoPaths.has(repoPath)) {
-        throw new Error(`scopes["${repoPath}"] does not match any repo path in group`);
-      }
-      const s = scopeRaw as Record<string, unknown>;
-      const rawEntryPoints = (s.entry_points as unknown[]) || [];
-      if (rawEntryPoints.length === 0) {
-        throw new Error(`scopes["${repoPath}"].entry_points must have at least one entry`);
-      }
-      const entry_points: EntryPoint[] = rawEntryPoints.map((ep: unknown, i: number) => {
-        const e = ep as Record<string, unknown>;
-        if (!e.method || typeof e.method !== 'string') {
-          throw new Error(`scopes["${repoPath}"].entry_points[${i}].method is required`);
-        }
-        return {
-          method: e.method as string,
-          ...(e.file ? { file: e.file as string } : {}),
-        };
-      });
-      scopes[repoPath] = {
-        entry_points,
-        ...(s.max_depth !== undefined ? { max_depth: Number(s.max_depth) } : {}),
-      };
-    }
-  }
-
   return {
     version: 1,
     name: raw.name as string,
@@ -125,7 +95,6 @@ export function parseGroupConfig(yamlContent: string): GroupConfig {
     packages,
     detect,
     matching,
-    ...(scopes ? { scopes } : {}),
   };
 }
 

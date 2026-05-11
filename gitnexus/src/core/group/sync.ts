@@ -3,7 +3,7 @@ import path from 'node:path';
 import { Buffer } from 'node:buffer';
 import { initLbug, closeLbug, executeParameterized } from '../lbug/pool-adapter.js';
 import { readRegistry, type RegistryEntry } from '../../storage/repo-manager.js';
-import type { GroupConfig, RepoHandle, RepoSnapshot, StoredContract, CrossLink, ShepherdDetectConfig, RepoScope } from './types.js';
+import type { GroupConfig, RepoHandle, RepoSnapshot, StoredContract, CrossLink, ShepherdDetectConfig } from './types.js';
 import { HttpRouteExtractor } from './extractors/http-route-extractor.js';
 import { GrpcExtractor } from './extractors/grpc-extractor.js';
 import { ThriftExtractor } from './extractors/thrift-extractor.js';
@@ -131,10 +131,6 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
   let manifestCrossLinks: CrossLink[] = [];
   let dbExecutors: Map<string, CypherExecutor> | undefined;
   let registryEntries: RegistryEntry[] | undefined;
-
-  // Scope filter: BFS-reachable methods per repo (populated during extraction if scopes configured)
-  // Keys in the set are "filePath::methodName" composite strings for method-level precision.
-  const scopeReachableMethods = new Map<string, Set<string>>();
 
   const eo = opts?.extractorOverride;
   if (eo && eo.length === 0) {
@@ -281,71 +277,6 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
             }
           }
 
-          // ─── Scope filter: BFS from entry points ─────────────────────
-          // If this repo has a scope config, run BFS from the declared entry
-          // points to collect all reachable file paths. These are later used
-          // to filter cross-links so only entry-point-reachable consumers
-          // participate in matching.
-          if (config.scopes?.[groupPath]) {
-            const scope = config.scopes[groupPath];
-            const depth = scope.max_depth ?? 15;
-            const reachable = new Set<string>();
-
-            for (const ep of scope.entry_points) {
-              try {
-                const whereClause = ep.file
-                  ? `start.name = '${ep.method}' AND start.filePath = '${ep.file}'`
-                  : `start.name = '${ep.method}'`;
-                // Return both filePath and method name for method-level scope filtering
-                const query = `MATCH (start)-[:CodeRelation* 1..${depth}]->(target) WHERE ${whereClause} RETURN DISTINCT target.filePath, target.name`;
-                const result = await executor(query, {});
-
-                // Parse Cypher result — expect rows with target.filePath and target.name
-                if (Array.isArray(result)) {
-                  for (const row of result) {
-                    const r = row as Record<string, unknown>;
-                    const fp = r['target.filePath'];
-                    const name = r['target.name'];
-                    if (typeof fp === 'string' && typeof name === 'string') {
-                      reachable.add(`${fp}::${name}`);
-                    } else if (typeof fp === 'string') {
-                      // Fallback: file-only (when name not available)
-                      reachable.add(`${fp}::*`);
-                    }
-                  }
-                } else if (result && typeof result === 'object') {
-                  // LadybugDB markdown table format
-                  const md = (result as Record<string, unknown>).markdown;
-                  if (typeof md === 'string') {
-                    const lines = md.split('\n');
-                    for (const line of lines.slice(2)) { // skip header + separator
-                      const cols = line.split('|').map((c: string) => c.trim()).filter(Boolean);
-                      if (cols.length >= 2 && cols[0] && !cols[0].startsWith('---')) {
-                        reachable.add(`${cols[0]}::${cols[1]}`);
-                      } else if (cols.length >= 1 && cols[0] && !cols[0].startsWith('---')) {
-                        reachable.add(`${cols[0]}::*`);
-                      }
-                    }
-                  }
-                }
-
-                if (opts?.verbose) {
-                  logger.info(
-                    `  scope[${groupPath}]: BFS from ${ep.method}${ep.file ? ` (${ep.file})` : ''} → ${reachable.size} reachable method nodes`,
-                  );
-                }
-              } catch (err) {
-                logger.warn(
-                  `[scope] BFS for ${groupPath} entry ${ep.method} failed: ${(err as Error).message}`,
-                );
-              }
-            }
-
-            if (reachable.size > 0) {
-              scopeReachableMethods.set(groupPath, reachable);
-            }
-          }
-
           const metaPath = path.join(handle.storagePath, 'meta.json');
           try {
             const raw = await fs.readFile(metaPath, 'utf-8');
@@ -477,50 +408,6 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
   // just like Thrift and Mafka — no special peer-link logic needed.
   let crossLinks = dedupeCrossLinks([...manifestCrossLinks, ...matched, ...wildcard.matched]);
   const allContracts: StoredContract[] = autoContracts;
-
-  // ─── Scope filter: restrict cross-links to BFS-reachable methods ────
-  // For repos with scope config, only keep cross-links whose consumer
-  // contract's callerMethod is in the BFS-reachable set. This ensures
-  // that only contracts invoked from methods reachable from the declared
-  // entry points survive — a file-level check is insufficient because the
-  // same file (e.g., a Gateway class) may contain both reachable and
-  // unreachable methods.
-  if (scopeReachableMethods.size > 0) {
-    // Build a lookup from symbolUid → StoredContract for callerMethod access
-    const contractByUid = new Map<string, StoredContract>();
-    for (const c of allContracts) {
-      contractByUid.set(c.symbolUid, c);
-    }
-
-    const beforeCount = crossLinks.length;
-    crossLinks = crossLinks.filter((link) => {
-      const reachable = scopeReachableMethods.get(link.from.repo);
-      if (!reachable) return true; // no scope for this repo — keep all
-
-      const contract = contractByUid.get(link.from.symbolUid);
-      const callerMethod = contract?.meta?.callerMethod as string | undefined;
-      const filePath = link.from.symbolRef.filePath;
-
-      if (callerMethod) {
-        // Method-level match: check "filePath::callerMethod"
-        if (reachable.has(`${filePath}::${callerMethod}`)) return true;
-        // Also check wildcard entries (file known reachable but method name not tracked)
-        if (reachable.has(`${filePath}::*`)) return true;
-        return false;
-      }
-
-      // No callerMethod available — fall back to file-level (any method in this file is reachable)
-      for (const key of reachable) {
-        if (key.startsWith(`${filePath}::`)) return true;
-      }
-      return false;
-    });
-    if (opts?.verbose) {
-      logger.info(
-        `  scope filter: ${beforeCount} → ${crossLinks.length} cross-links (removed ${beforeCount - crossLinks.length} unreachable)`,
-      );
-    }
-  }
 
   const registry: ContractRegistry = {
     version: 1,
