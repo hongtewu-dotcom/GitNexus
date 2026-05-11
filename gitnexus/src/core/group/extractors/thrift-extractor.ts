@@ -217,7 +217,10 @@ export async function buildThriftContext(repoPath: string): Promise<ThriftContex
     cwd: repoPath,
     absolute: false,
     nodir: true,
-    ignore: ['**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**'],
+    ignore: [
+      '**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**',
+      '**/src/test/**', '**/src/it/**', '**/test/**', '**/tests/**',
+    ],
   });
   const namespacesByThrift = new Map<string, string>();
   const servicesByName = new Map<string, ThriftServiceInfo[]>();
@@ -290,7 +293,12 @@ export class ThriftExtractor implements ContractExtractor {
       cwd: repoPath,
       absolute: false,
       nodir: true,
-      ignore: ['**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**'],
+      ignore: [
+        '**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**',
+        '**/src/test/**', '**/src/it/**', '**/test/**', '**/tests/**',
+        '**/*Test.java', '**/*Tests.java', '**/*Spec.java',
+        '**/*Mock*.java', '**/*Stub*.java', '**/*Fake*.java',
+      ],
     });
 
     const parser = new Parser();
@@ -340,6 +348,7 @@ export class ThriftExtractor implements ContractExtractor {
           service: info.serviceName,
           method: detection.methodName,
           source: detection.source,
+          ...(detection.callerMethod ? { callerMethod: detection.callerMethod } : {}),
         },
       );
     }
@@ -361,6 +370,7 @@ export class ThriftExtractor implements ContractExtractor {
         service: detection.serviceName,
         method: detection.methodName,
         source: 'java_thrift_consumer_weak',
+        ...(detection.callerMethod ? { callerMethod: detection.callerMethod } : {}),
       },
     );
   }

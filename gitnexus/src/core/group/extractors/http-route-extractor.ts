@@ -74,6 +74,8 @@ export function normalizeHttpPath(p: string): string {
  * Consumer-side normalization is more aggressive:
  *   - template literals (`${x}`) → `{param}`
  *   - strip protocol + host if the URL is absolute
+ *   - strip leading `{param}/` when it represents a base-URL / host variable
+ *     (e.g. `${apiHost}/x/order/query` → `/x/order/query`)
  *   - numeric segments → `{param}` (so `/api/orders/42` → `/api/orders/{param}`)
  */
 function normalizeConsumerPath(url: string): string {
@@ -86,6 +88,10 @@ function normalizeConsumerPath(url: string): string {
       pathOnly = templated.replace(/^https?:\/\/[^/]+/i, '');
     }
   }
+  // Strip leading {param}/ — this occurs when a template literal like
+  // `${baseUrl}/api/resource` is used; the {param} represents the host/
+  // base-URL and should not appear in the contractId path.
+  pathOnly = pathOnly.replace(/^\{param\}\/?/, '/');
   const normalized = normalizeHttpPath(pathOnly || '/');
   const segments = normalized
     .split('/')

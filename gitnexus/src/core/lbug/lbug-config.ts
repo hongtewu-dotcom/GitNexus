@@ -61,7 +61,7 @@ export function createLbugDatabase(
   return new lbugModule.Database(
     databasePath,
     0,
-    false,
+    true,
     options.readOnly ?? false,
     LBUG_MAX_DB_SIZE,
   );

@@ -11,6 +11,8 @@ export interface ThriftDetection {
   confidenceWithIdl: number;
   confidenceWithoutIdl: number;
   usesGeneratedServiceMember?: boolean;
+  /** The enclosing method that makes this thrift call (for scope filtering). */
+  callerMethod?: string;
 }
 
 export interface ThriftLanguagePlugin {

@@ -147,6 +147,12 @@ export interface AnalyzeOptions {
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
   embeddingDevice?: string;
+  /**
+   * Fast mode: skip communities and processes phases but keep MRO.
+   * When both `--fast` and internal `skipGraphPhases` are set,
+   * `skipGraphPhases` takes precedence (skips all three).
+   */
+  fast?: boolean;
 }
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
@@ -411,6 +417,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
         skipGit: options?.skipGit,
         skipAgentsMd: options?.skipAgentsMd,
         noStats: options?.noStats,
+        fast: options?.fast,
         registryName: options?.name,
         // Registry-collision bypass — its own CLI flag, intentionally NOT
         // overloading --force. A user who hits the collision guard should

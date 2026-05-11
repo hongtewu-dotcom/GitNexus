@@ -77,6 +77,55 @@ const JAVA_TOPIC_SPEC: LanguagePatterns<TopicMeta> = {
           arguments: (argument_list . (string_literal) @value))
       `,
     },
+    // ─── Mafka (MDP) ───────────────────────────────────────────────────────
+    {
+      meta: {
+        role: 'consumer',
+        broker: 'mafka',
+        confidence: 0.85,
+        symbolName: 'MdpMafkaConsumer',
+      },
+      query: `
+        (annotation
+          name: (identifier) @name (#eq? @name "MdpMafkaConsumer")
+          arguments: (annotation_argument_list
+            (element_value_pair
+              key: (identifier) @key (#eq? @key "topic")
+              value: (string_literal) @value)))
+      `,
+    },
+    {
+      meta: {
+        role: 'consumer',
+        broker: 'mafka',
+        confidence: 0.85,
+        symbolName: 'ConsumeMessage',
+      },
+      query: `
+        (annotation
+          name: (identifier) @name (#eq? @name "ConsumeMessage")
+          arguments: (annotation_argument_list
+            (element_value_pair
+              key: (identifier) @key (#eq? @key "topic")
+              value: (string_literal) @value)))
+      `,
+    },
+    {
+      meta: {
+        role: 'provider',
+        broker: 'mafka',
+        confidence: 0.85,
+        symbolName: 'MdpMafkaProducer',
+      },
+      query: `
+        (annotation
+          name: (identifier) @name (#eq? @name "MdpMafkaProducer")
+          arguments: (annotation_argument_list
+            (element_value_pair
+              key: (identifier) @key (#eq? @key "topic")
+              value: (string_literal) @value)))
+      `,
+    },
   ],
 };
 

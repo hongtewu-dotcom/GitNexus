@@ -217,6 +217,19 @@ export const JAVA_THRIFT_PLUGIN: ThriftLanguagePlugin = {
       if (!callNode) continue;
       const binding = resolveServiceForReceiver(bindings, receiver, callNode);
       if (!binding) continue;
+
+      // Walk up AST to find enclosing method declaration
+      let callerMethod: string | undefined;
+      let ancestor = callNode.parent;
+      while (ancestor) {
+        if (ancestor.type === 'method_declaration') {
+          const nameNode = ancestor.childForFieldName('name');
+          if (nameNode) callerMethod = nameNode.text;
+          break;
+        }
+        ancestor = ancestor.parent;
+      }
+
       out.push({
         role: 'consumer',
         serviceName: binding.serviceName,
@@ -226,6 +239,7 @@ export const JAVA_THRIFT_PLUGIN: ThriftLanguagePlugin = {
         confidenceWithIdl: 0.75,
         confidenceWithoutIdl: 0.45,
         usesGeneratedServiceMember: binding.usesGeneratedServiceMember,
+        callerMethod,
       });
     }
 

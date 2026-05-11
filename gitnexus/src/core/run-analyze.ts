@@ -82,6 +82,11 @@ export interface AnalyzeOptions {
   /** Omit volatile symbol/relationship counts from AGENTS.md and CLAUDE.md. */
   noStats?: boolean;
   /**
+   * Fast mode: skip communities and processes but keep MRO.
+   * Maps to PipelineOptions.fastMode.
+   */
+  fast?: boolean;
+  /**
    * User-provided alias for the registry `name` (#829). When set,
    * forwarded to `registerRepo` so the indexed repo is stored under
    * this alias instead of the path-derived basename.
@@ -274,6 +279,8 @@ export async function runFullAnalysis(
     const scaled = Math.round(p.percent * 0.6);
     const message = p.detail ? `${p.message || phaseLabel} (${p.detail})` : p.message || phaseLabel;
     progress(p.phase, scaled, message);
+  }, {
+    fastMode: options.fast,
   });
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────

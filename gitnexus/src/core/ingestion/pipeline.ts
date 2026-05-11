@@ -42,6 +42,12 @@ import {
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
   skipGraphPhases?: boolean;
+  /**
+   * Fast mode: skip communities and processes but keep MRO.
+   * When both `skipGraphPhases` and `fastMode` are set, `skipGraphPhases`
+   * takes precedence (skips all three phases including MRO).
+   */
+  fastMode?: boolean;
   /** Force sequential parsing (no worker pool). Useful for testing the sequential path. */
   skipWorkers?: boolean;
   /**
@@ -84,7 +90,16 @@ function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
     scopeResolutionPhase,
   ];
 
-  if (!options?.skipGraphPhases) {
+  if (options?.skipGraphPhases) {
+    // skipGraphPhases takes precedence: skip MRO + communities + processes
+    return phases;
+  }
+
+  if (options?.fastMode) {
+    // Fast mode: keep MRO but skip communities + processes
+    phases.push(mroPhase);
+  } else {
+    // Full mode: all graph phases
     phases.push(mroPhase, communitiesPhase, processesPhase);
   }
 
@@ -120,7 +135,7 @@ export const runPipelineFromRepo = async (
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
 
-  if (!options?.skipGraphPhases) {
+  if (!options?.skipGraphPhases && !options?.fastMode) {
     communityResult = getPhaseOutput<CommunitiesOutput>(results, 'communities').communityResult;
     processResult = getPhaseOutput<ProcessesOutput>(results, 'processes').processResult;
   }
