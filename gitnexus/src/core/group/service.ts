@@ -308,6 +308,11 @@ export class GroupService {
     return runGroupImpact({ port: this.port, gitnexusDir: getDefaultGitnexusDir() }, params);
   }
 
+  async groupTrace(params: Record<string, unknown>): Promise<unknown> {
+    const { runGroupTrace } = await import('./trace.js');
+    return runGroupTrace({ port: this.port, gitnexusDir: getDefaultGitnexusDir() }, params as any);
+  }
+
   async groupContext(params: Record<string, unknown>): Promise<GroupContextResult> {
     const name = String(params.name ?? '').trim();
     const target = typeof params.target === 'string' ? params.target.trim() : '';

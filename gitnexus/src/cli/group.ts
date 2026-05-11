@@ -373,4 +373,107 @@ export function registerGroupCommands(program: Command): void {
         await backend.dispose().catch(() => {});
       }
     });
+
+  group
+    .command('trace <name>')
+    .description('Cross-repo call trace — follow CALLS edges across repos via CrossLinks')
+    .requiredOption('--target <symbol>', 'Symbol name, file path, or node id to start from')
+    .requiredOption(
+      '--repo <groupPath>',
+      'Member path from group.yaml (e.g. app/backend)',
+    )
+    .option('--direction <dir>', 'downstream or upstream', 'downstream')
+    .option('--max-depth <n>', 'Max BFS depth within each repo', '5')
+    .option('--max-cross-depth <n>', 'Max cross-repo hops', '3')
+    .option('--relation-types <types>', 'Comma-separated relation types (default: CALLS)', 'CALLS')
+    .option('--min-confidence <n>', 'Minimum edge confidence (0–1)', '0')
+    .option('--include-tests', 'Include test files in traversal', false)
+    .option('--json', 'JSON output')
+    .action(async (name: string, opts: Record<string, string | boolean | undefined>) => {
+      const { LocalBackend } = await import('../mcp/local/local-backend.js');
+
+      const backend = new LocalBackend();
+      try {
+        await backend.init();
+
+        const maxDepth = parseInt(String(opts.maxDepth ?? '5'), 10) || 5;
+        const maxCrossDepth = parseInt(String(opts.maxCrossDepth ?? '3'), 10) || 3;
+        const minConfidence = parseFloat(String(opts.minConfidence ?? '0')) || 0;
+        const relationTypes = String(opts.relationTypes ?? 'CALLS')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        const raw = await backend.getGroupService().groupTrace({
+          name,
+          repo: String(opts.repo),
+          target: String(opts.target),
+          direction: (opts.direction as string) || 'downstream',
+          maxDepth,
+          maxCrossDepth,
+          relationTypes,
+          includeTests: Boolean(opts.includeTests),
+          minConfidence,
+        });
+
+        if (raw && typeof raw === 'object' && 'error' in raw) {
+          logger.error(String((raw as { error: string }).error));
+          process.exitCode = 1;
+          return;
+        }
+
+        const result = raw as {
+          entryTarget: string;
+          entryRepo: string;
+          direction: string;
+          segments: Array<{
+            repo: string;
+            repoPath: string;
+            entrySymbolUid: string;
+            nodes: unknown[];
+            crossHops: Array<{
+              from: { repo: string };
+              to: { repo: string };
+              contractType: string;
+              contractId: string;
+              linkConfidence: number;
+            }>;
+          }>;
+          skippedRepos: string[];
+          truncated: boolean;
+        };
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(
+            `Trace: ${result.entryTarget} (${result.entryRepo}) [${result.direction}]\n`,
+          );
+          for (const seg of result.segments) {
+            console.log(`  Repo: ${seg.repoPath} (${seg.repo})`);
+            console.log(`    Entry: ${seg.entrySymbolUid}`);
+            console.log(`    Nodes: ${seg.nodes.length}`);
+            if (seg.crossHops.length > 0) {
+              console.log(`    Cross-hops:`);
+              for (const hop of seg.crossHops) {
+                console.log(
+                  `      ${hop.from.repo} -> ${hop.to.repo}  [${hop.contractType}] ${hop.contractId}  (conf=${hop.linkConfidence})`,
+                );
+              }
+            }
+          }
+          if (result.skippedRepos.length > 0) {
+            console.log(`\n  Skipped repos: ${result.skippedRepos.join(', ')}`);
+          }
+          if (result.truncated) {
+            console.log(`\n  (truncated — maxCrossDepth reached)`);
+          }
+          console.log(
+            `\n  Total: ${result.segments.length} repo segments, ${result.segments.reduce((s, seg) => s + seg.nodes.length, 0)} nodes`,
+          );
+        }
+      } finally {
+        await backend.dispose().catch(() => {});
+      }
+    });
 }
