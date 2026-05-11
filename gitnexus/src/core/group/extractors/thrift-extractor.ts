@@ -359,7 +359,6 @@ export class ThriftExtractor implements ContractExtractor {
           service: info.serviceName,
           method: detection.methodName,
           source: detection.source,
-          ...(detection.callerMethod ? { callerMethod: detection.callerMethod } : {}),
         },
       );
     }
@@ -381,7 +380,6 @@ export class ThriftExtractor implements ContractExtractor {
         service: detection.serviceName,
         method: detection.methodName,
         source: 'java_thrift_consumer_weak',
-        ...(detection.callerMethod ? { callerMethod: detection.callerMethod } : {}),
       },
     );
   }
