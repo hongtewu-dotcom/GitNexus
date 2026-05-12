@@ -119,8 +119,8 @@ export interface TraceDeps {
 // Defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MAX_DEPTH = 5;
-const DEFAULT_MAX_CROSS_DEPTH = 3;
+const DEFAULT_MAX_DEPTH = 12;
+const DEFAULT_MAX_CROSS_DEPTH = 5;
 const DEFAULT_RELATION_TYPES = ['CALLS'];
 
 // ---------------------------------------------------------------------------
@@ -139,21 +139,129 @@ function isTestFilePath(fp: string): boolean {
   );
 }
 
-/** Resolve a symbol name/file to its lbug node id. */
+// ---------------------------------------------------------------------------
+// Candidate scoring helpers (shared by resolveEntrySymbol & resolveByName)
+// ---------------------------------------------------------------------------
+
+type SymbolCandidate = { id: string; name: string; type: string; filePath: string };
+
+/** Extract type from node id prefix (e.g. "Method:..." → "Method"). */
+function effectiveType(c: SymbolCandidate): string {
+  if (c.type) return c.type;
+  const colonIdx = c.id.indexOf(':');
+  if (colonIdx > 0) return c.id.slice(0, colonIdx);
+  return '';
+}
+
+/** Detect utility/DTO/enum classes that are poor BFS entry points. */
+function isUtilOrDto(c: SymbolCandidate): boolean {
+  const idLower = c.id.toLowerCase();
+  const fpLower = (c.filePath || '').toLowerCase();
+  const combined = `${idLower}|${fpLower}`;
+  return /utils?[./|]/.test(combined) ||
+    /enum[./|]/.test(combined) ||
+    /validate[./|]/.test(combined) ||
+    /convert[./|]/.test(combined) ||
+    /dto[./|]/.test(combined) ||
+    /entity[./|]/.test(combined) ||
+    /\.set[A-Z]/.test(c.id) ||
+    /\.get[A-Z]/.test(c.id) ||
+    /\.is[A-Z]/.test(c.id) ||
+    combined.includes('jsonutils') ||
+    combined.includes('paramvalidate') ||
+    combined.includes('loggerutil') ||
+    combined.includes('logutil');
+}
+
+/** Detect Thrift Iface / interface definitions (dead-end for BFS). */
+function isIfaceOrThriftDef(c: SymbolCandidate): boolean {
+  if (c.id.includes('Iface.') || c.id.includes(':Iface.')) return true;
+  const fp = c.filePath || '';
+  if (fp.includes('-thrift/') || fp.includes('_thrift/')) return true;
+  return false;
+}
+
+/**
+ * Score a candidate symbol for BFS entry quality.
+ * Higher = better entry point.
+ * @param classVariants  Optional class-name variants for fuzzy matching.
+ * @param target  Optional original target name for semantic relevance scoring.
+ */
+function scoreCandidate(c: SymbolCandidate, classVariants?: string[], target?: string): number {
+  let s = 0;
+  const idAndPath = `${c.id}|${c.filePath}`;
+
+  if (classVariants) {
+    for (const variant of classVariants) {
+      if (idAndPath.includes(variant)) { s += 100; break; }
+    }
+  }
+
+  const nodeType = effectiveType(c);
+  if (nodeType === 'Method') s += 10;
+
+  if (c.filePath && (c.filePath.includes('-server/') || c.filePath.includes('-service/'))) {
+    s += 50;
+  }
+  if (c.filePath && (c.filePath.toLowerCase().includes('impl') || c.filePath.includes('-impl/'))) {
+    s += 20;
+  }
+
+  // Thrift server entry points: strongly prefer classes named *ThriftServer*,
+  // *ThriftServiceImpl*, *RpcServiceImpl* — these are RPC entry facades.
+  const idLowerForThrift = c.id.toLowerCase();
+  if (idLowerForThrift.includes('thriftserver') || idLowerForThrift.includes('thriftserviceimpl') ||
+      idLowerForThrift.includes('rpcserviceimpl')) {
+    s += 30;
+  }
+  // Penalize gateway/delegate/adapter patterns (less likely primary entry)
+  if (/gateway|delegate|adapter|proxy|wrapper/i.test(c.id)) {
+    s -= 15;
+  }
+
+  // Semantic relevance: when a target name is provided, check if the class/file
+  // name contains the PascalCase version of the target (e.g. target "secondCheck"
+  // → PascalCase "SecondCheck" → prefer SecondCheckThriftServer over Reschedule*).
+  if (target && target.length > 0) {
+    const pascalTarget = target[0].toUpperCase() + target.slice(1); // "secondCheck" → "SecondCheck"
+    if (idAndPath.includes(pascalTarget)) {
+      s += 40;
+    }
+  }
+
+  if (isIfaceOrThriftDef(c)) s -= 200;
+
+  if (c.filePath && (c.filePath.includes('-client/') || c.filePath.includes('-client-'))) {
+    s -= 60;
+  }
+
+  if (isUtilOrDto(c)) s -= 80;
+
+  if (isTestFilePath(c.filePath)) s -= 50;
+
+  return s;
+}
+
+/** Resolve a symbol name/file to its lbug node id.
+ *
+ * When multiple candidates match by name, uses the same scoring logic as
+ * resolveByName to prefer implementation classes over client interfaces,
+ * Method nodes over Class nodes, and -server/ paths over -client/ paths.
+ */
 async function resolveEntrySymbol(
   repoId: string,
   target: string,
 ): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  // Try exact id match first
-  let rows = await executeParameterized(
+  // Try exact id match first (unique, no scoring needed)
+  const exactRows = await executeParameterized(
     repoId,
     `MATCH (n) WHERE n.id = $target
      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
      LIMIT 1`,
     { target },
   );
-  if (rows.length > 0) {
-    const r = rows[0];
+  if (exactRows.length > 0) {
+    const r = exactRows[0];
     return {
       id: r.id ?? r[0],
       name: r.name ?? r[1],
@@ -162,33 +270,94 @@ async function resolveEntrySymbol(
     };
   }
 
-  // Try name match
-  rows = await executeParameterized(
+  // Fetch ALL candidates matching by name (no LIMIT 1)
+  const nameRows = await executeParameterized(
     repoId,
     `MATCH (n) WHERE n.name = $target
-     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-     LIMIT 1`,
+     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
     { target },
   );
-  if (rows.length > 0) {
-    const r = rows[0];
-    return {
-      id: r.id ?? r[0],
-      name: r.name ?? r[1],
-      type: r.type ?? r[2],
-      filePath: r.filePath ?? r[3],
-    };
-  }
+  if (nameRows.length === 0) return null;
 
-  return null;
+  const candidates: SymbolCandidate[] = nameRows.map((r: Record<string, unknown>) => ({
+    id: (r.id ?? r[0]) as string,
+    name: (r.name ?? r[1]) as string,
+    type: (r.type ?? r[2]) as string,
+    filePath: (r.filePath ?? r[3]) as string,
+  }));
+
+  // Single candidate — no scoring needed
+  if (candidates.length === 1) return candidates[0];
+
+  // Score and pick the best candidate (pass target for semantic relevance)
+  candidates.sort((a, b) => scoreCandidate(b, undefined, target) - scoreCandidate(a, undefined, target));
+
+  const best = candidates[0];
+  logger.info(
+    `[trace] resolveEntrySymbol "${target}": ${candidates.length} candidates, ` +
+    `selected "${best.id}" (score=${scoreCandidate(best, undefined, target)}) over ${candidates.slice(1, 4).map(c => `"${c.id}"(${scoreCandidate(c, undefined, target)})`).join(', ')}${candidates.length > 4 ? ` ... and ${candidates.length - 4} more` : ''}`,
+  );
+
+  return best;
 }
 
-/** Resolve a symbol by name in a repo's lbug (for cross-repo entry). */
+/**
+ * Quick check: is this symbolName clearly NOT a resolvable Java symbol?
+ * Returns true for synthetic names generated by non-RPC extractors (topic/mafka,
+ * squirrel, crane) that will never exist in LadybugDB.
+ *
+ * Patterns rejected:
+ *   - mafkaProducer(...) / mafkaConsumer(...)
+ *   - kafkaListener, kafkaTemplate.send, rabbitTemplate.convertAndSend
+ *   - MdpMafkaConsumer, MdpMafkaProducer, ConsumeMessage
+ *   - squirrel property keys (contain dots but start with lowercase, e.g. "squirrel.fare.fd.category.name")
+ *   - crane.task.xxx / methodName@taskName
+ */
+function isUnresolvableSymbolName(symbolName: string): boolean {
+  // mafkaProducer(...) / mafkaConsumer(...)
+  if (/^mafka(?:Producer|Consumer)\(/.test(symbolName)) return true;
+  // Well-known topic extractor synthetic names
+  if (
+    symbolName === 'kafkaListener' ||
+    symbolName === 'kafkaTemplate.send' ||
+    symbolName === 'rabbitTemplate.convertAndSend' ||
+    symbolName === 'MdpMafkaConsumer' ||
+    symbolName === 'MdpMafkaProducer' ||
+    symbolName === 'ConsumeMessage' ||
+    symbolName === 'rabbitListener'
+  ) return true;
+  // crane: "methodName@taskName" or "crane.task.xxx"
+  if (symbolName.includes('@') || symbolName.startsWith('crane.task.')) return true;
+  // squirrel property keys: "squirrel.xxx" or multi-dot lowercase path (>= 3 dots)
+  if (symbolName.startsWith('squirrel.')) return true;
+  if ((symbolName.match(/\./g) ?? []).length >= 3 && symbolName[0] === symbolName[0].toLowerCase()) return true;
+  return false;
+}
+
+/** Resolve a symbol by name in a repo's lbug (for cross-repo entry).
+ *
+ * symbolName comes from contracts.json `to.symbolRef.name`, typically in
+ * "ClassName.methodName" format (e.g. "SecondCheckThriftService.secondCheck").
+ *
+ * LadybugDB stores `n.name` as just the method name (e.g. "secondCheck"),
+ * so the full qualified name will never match directly. When the short-name
+ * fallback returns multiple candidates we disambiguate by:
+ *   1. Preferring nodes whose id/filePath contains the class-name prefix
+ *      (or a common variant like Service→Server, e.g. "SecondCheckThriftServer").
+ *   2. Preferring Method nodes over Class/Interface nodes.
+ *   3. Excluding test files.
+ */
 async function resolveByName(
   repoId: string,
   symbolName: string,
 ): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  // Try exact name match (e.g. "RiskService.queryRiskLevel")
+  // Fast-reject synthetic/non-Java symbol names that will never resolve in lbug
+  if (isUnresolvableSymbolName(symbolName)) {
+    logger.info(`[trace] resolveByName: skipping unresolvable symbol "${symbolName}"`);
+    return null;
+  }
+
+  // Try exact name match first (works when lbug stores qualified names)
   const rows = await executeParameterized(
     repoId,
     `MATCH (n) WHERE n.name = $name
@@ -206,29 +375,57 @@ async function resolveByName(
     };
   }
 
-  // Try matching the last segment (e.g. "queryRiskLevel" from "RiskService.queryRiskLevel")
+  // Extract class prefix and short method name
   const lastDot = symbolName.lastIndexOf('.');
-  if (lastDot >= 0) {
-    const shortName = symbolName.slice(lastDot + 1);
-    const rows2 = await executeParameterized(
-      repoId,
-      `MATCH (n) WHERE n.name = $name
-       RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-       LIMIT 1`,
-      { name: shortName },
-    );
-    if (rows2.length > 0) {
-      const r = rows2[0];
-      return {
-        id: r.id ?? r[0],
-        name: r.name ?? r[1],
-        type: r.type ?? r[2],
-        filePath: r.filePath ?? r[3],
-      };
-    }
+  if (lastDot < 0) return null; // no dot → nothing more to try
+
+  const classPrefix = symbolName.slice(0, lastDot);   // e.g. "SecondCheckThriftService"
+  const shortName = symbolName.slice(lastDot + 1);     // e.g. "secondCheck"
+
+  // Fetch ALL candidates with the short name (no LIMIT 1)
+  const rows2 = await executeParameterized(
+    repoId,
+    `MATCH (n) WHERE n.name = $name
+     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
+    { name: shortName },
+  );
+  if (rows2.length === 0) return null;
+
+  const candidates: SymbolCandidate[] = rows2.map((r: Record<string, unknown>) => ({
+    id: (r.id ?? r[0]) as string,
+    name: (r.name ?? r[1]) as string,
+    type: (r.type ?? r[2]) as string,
+    filePath: (r.filePath ?? r[3]) as string,
+  }));
+
+  // Build class-name variants for fuzzy matching:
+  // "SecondCheckThriftService" → also try "SecondCheckThriftServer", "SecondCheckThrift"
+  const classVariants = [classPrefix];
+  if (classPrefix.endsWith('Service')) {
+    classVariants.push(classPrefix.replace(/Service$/, 'Server'));
+    classVariants.push(classPrefix.replace(/Service$/, 'Impl'));
+    classVariants.push(classPrefix.replace(/Service$/, ''));
+  } else if (classPrefix.endsWith('Server')) {
+    classVariants.push(classPrefix.replace(/Server$/, 'Service'));
+    classVariants.push(classPrefix.replace(/Server$/, 'Impl'));
+    classVariants.push(classPrefix.replace(/Server$/, ''));
+  } else if (classPrefix.endsWith('Impl')) {
+    classVariants.push(classPrefix.replace(/Impl$/, 'Service'));
+    classVariants.push(classPrefix.replace(/Impl$/, 'Server'));
+    classVariants.push(classPrefix.replace(/Impl$/, ''));
   }
 
-  return null;
+  candidates.sort((a, b) => scoreCandidate(b, classVariants) - scoreCandidate(a, classVariants));
+
+  const best = candidates[0];
+  if (candidates.length > 1) {
+    logger.info(
+      `[trace] resolveByName "${symbolName}": ${candidates.length} candidates for short name "${shortName}", ` +
+      `selected "${best.id}" (score=${scoreCandidate(best, classVariants)}) over ${candidates.slice(1).map(c => `"${c.id}"(${scoreCandidate(c, classVariants)})`).join(', ')}`,
+    );
+  }
+
+  return best;
 }
 
 /**
@@ -257,17 +454,16 @@ async function intraRepoBFS(
   const nodes: TraceNode[] = [];
 
   for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
-    const idList = frontier.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
-
+    // Use parameterized query to avoid isWriteQuery false positives when
+    // node IDs contain keywords like CREATE, SET, DELETE, etc.
     const query =
       direction === 'downstream'
-        ? `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
-        : `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
+        ? `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $idList AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
+        : `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $idList AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
 
     let related: any[];
     try {
-      const { executeQuery } = await import('../lbug/pool-adapter.js');
-      related = await executeQuery(repoId, query);
+      related = await executeParameterized(repoId, query, { idList: frontier });
     } catch (e) {
       logger.warn(`[trace] BFS query failed at depth ${depth}: ${e}`);
       break;
@@ -309,11 +505,19 @@ async function intraRepoBFS(
  * Find cross-repo hops by matching BFS-visited file paths against
  * contracts.json crossLinks.
  *
- * For downstream: find crossLinks where from.repo == currentRepo and
- * from.symbolRef.filePath is in the visited file set.
+ * For RPC (thrift/http/grpc):
+ *   - downstream: from.repo == currentRepo (consumer calls provider)
+ *   - upstream: to.repo == currentRepo (provider is called by consumer)
  *
- * For upstream: find crossLinks where to.repo == currentRepo and
- * to.symbolRef.filePath is in the visited file set.
+ * For MQ (topic):
+ *   - Data flows from producer (to) → consumer (from), opposite to RPC.
+ *   - downstream: to.repo == currentRepo (producer sends to consumer)
+ *   - upstream: from.repo == currentRepo (consumer receives from producer)
+ *
+ * Topic hop deduplication: For topic-type crossLinks, multiple consumers in the
+ * same target repo (e.g. different consumer groups on the same topic) produce
+ * duplicate hops.  We dedup by (contractType, targetRepo) for topics, keeping
+ * only the first hop per target repo per topic contractId.
  */
 function findCrossRepoHopsFromRegistry(
   crossLinks: CrossLink[],
@@ -325,17 +529,34 @@ function findCrossRepoHopsFromRegistry(
   const seen = new Set<string>();
 
   for (const link of crossLinks) {
-    const localEndpoint = direction === 'downstream' ? link.from : link.to;
-    const remoteEndpoint = direction === 'downstream' ? link.to : link.from;
+    // For topic/MQ contracts, data flow is reversed relative to the
+    // consumer→provider convention used by RPC contracts.
+    // In crossLinks: from=consumer, to=provider.
+    // For RPC downstream: consumer(from) in current repo → jump to provider(to).
+    // For MQ downstream: producer(to) in current repo → jump to consumer(from).
+    const isTopic = link.type === 'topic';
+    const effectiveDirection = isTopic
+      ? (direction === 'downstream' ? 'upstream' : 'downstream')
+      : direction;
+
+    const localEndpoint = effectiveDirection === 'downstream' ? link.from : link.to;
+    const remoteEndpoint = effectiveDirection === 'downstream' ? link.to : link.from;
 
     // Must match current repo
     if (localEndpoint.repo !== repoPath) continue;
     // Skip self-links
     if (remoteEndpoint.repo === repoPath) continue;
-    // Must have a visited file path
-    if (!visitedFilePaths.has(localEndpoint.symbolRef.filePath)) continue;
+    // For topic/MQ: match at repo level (producer/consumer declarations live in
+    // config files like mafka.properties, not in the code call graph).
+    // For RPC: require a visited file path from BFS traversal.
+    if (!isTopic && !visitedFilePaths.has(localEndpoint.symbolRef.filePath)) continue;
 
-    const key = `${link.contractId}::${repoPath}->${remoteEndpoint.repo}`;
+    // Dedup key: for topic hops, dedup by (contractId, targetRepo) to collapse
+    // multiple consumer groups in the same target repo into one hop.
+    // For RPC, keep the existing (contractId, sourceRepo->targetRepo) dedup.
+    const key = isTopic
+      ? `topic::${link.contractId}::${remoteEndpoint.repo}`
+      : `${link.contractId}::${repoPath}->${remoteEndpoint.repo}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -358,6 +579,114 @@ function findCrossRepoHopsFromRegistry(
   }
 
   return hops;
+}
+
+// ---------------------------------------------------------------------------
+// Segment processing (extracted for parallel execution)
+// ---------------------------------------------------------------------------
+
+type QueueItem = { repoPath: string; symbolName: string; crossDepth: number; isTopic?: boolean };
+
+interface SegmentResult {
+  repoPath: string;
+  skipped: boolean;
+  segment?: TraceRepoSegment;
+}
+
+/**
+ * Process a single cross-repo segment: resolve repo → init lbug → resolve
+ * symbol → BFS → find crossHops.  Pure function of its inputs (no shared
+ * mutable state except openedRepoIds which is append-only and safe in JS
+ * single-threaded Promise.all).
+ */
+async function processOneSegment(
+  item: QueueItem,
+  config: GroupConfig,
+  deps: TraceDeps,
+  crossLinks: CrossLink[],
+  direction: 'downstream' | 'upstream',
+  maxDepth: number,
+  relationTypes: string[],
+  includeTests: boolean,
+  minConfidence: number,
+  openedRepoIds: string[],
+): Promise<SegmentResult> {
+  const regName = config.repos[item.repoPath];
+  if (!regName) {
+    return { repoPath: item.repoPath, skipped: true };
+  }
+
+  let repoHandle: GroupRepoHandle;
+  try {
+    repoHandle = await deps.port.resolveRepo(regName);
+  } catch {
+    return { repoPath: item.repoPath, skipped: true };
+  }
+
+  // Init lbug
+  const dbPath = `${repoHandle.storagePath}/lbug`;
+  try {
+    await initLbug(repoHandle.id, dbPath);
+    if (!openedRepoIds.includes(repoHandle.id)) {
+      openedRepoIds.push(repoHandle.id);
+    }
+  } catch {
+    return { repoPath: item.repoPath, skipped: true };
+  }
+
+  // Resolve the target symbol by name in this repo's lbug.
+  // For topic/MQ hops, symbolName is "mafkaConsumer(...)" or "mafkaProducer(...)"
+  // which won't exist in LadybugDB (it stores Java symbols). In that case we
+  // skip resolveByName and still add the repo as a segment (with empty nodes)
+  // so we can discover further crossHops from this repo.
+  let nodes: TraceNode[] = [];
+  let visitedFilePaths: Set<string> = new Set();
+  let entrySymbolUid = item.symbolName; // fallback for topic hops
+
+  if (item.isTopic) {
+    // Topic hop: no BFS possible (no entry symbol), but still discover crossHops
+    logger.info(
+      `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName, will discover crossHops at repo level`,
+    );
+  } else {
+    const targetSym = await resolveByName(repoHandle.id, item.symbolName);
+    if (!targetSym) {
+      logger.warn(
+        `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
+      );
+      return { repoPath: item.repoPath, skipped: true };
+    }
+
+    entrySymbolUid = targetSym.id;
+
+    // BFS within this repo
+    const bfsResult = await intraRepoBFS(
+      repoHandle.id,
+      [targetSym.id],
+      targetSym.filePath ? [targetSym.filePath] : [],
+      direction,
+      { maxDepth, relationTypes, includeTests, minConfidence },
+    );
+    nodes = bfsResult.nodes;
+    visitedFilePaths = bfsResult.visitedFilePaths;
+  }
+
+  // Find cross-repo hops via contracts.json
+  const crossHops = findCrossRepoHopsFromRegistry(
+    crossLinks, item.repoPath, visitedFilePaths, direction,
+  );
+
+  return {
+    repoPath: item.repoPath,
+    skipped: false,
+    segment: {
+      repo: regName,
+      repoPath: item.repoPath,
+      entrySymbolUid,
+      nodes,
+      crossHops,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +762,6 @@ export async function runGroupTrace(
   let truncated = false;
 
   // Queue: each item is a (repoPath, symbolName) to trace into
-  type QueueItem = { repoPath: string; symbolName: string; crossDepth: number };
   const queue: QueueItem[] = [];
 
   // --- Phase 1: entry repo ---
@@ -474,95 +802,91 @@ export async function runGroupTrace(
 
     // Enqueue cross-repo targets
     for (const hop of crossHops) {
-      const targetEndpoint = direction === 'downstream' ? hop.to : hop.from;
-      const key = `${targetEndpoint.repo}::${targetEndpoint.symbolName}`;
+      // For topic/MQ: data flows from producer(to) → consumer(from),
+      // so downstream target is hop.from (consumer), upstream target is hop.to (producer).
+      // For RPC: downstream target is hop.to (provider), upstream target is hop.from (consumer).
+      const isTopic = hop.contractType === 'topic';
+      const targetEndpoint = isTopic
+        ? (direction === 'downstream' ? hop.from : hop.to)
+        : (direction === 'downstream' ? hop.to : hop.from);
+      // For topic hops, dedup by repo only (BFS is skipped anyway, and
+      // findCrossRepoHopsFromRegistry is repo-level, so re-entering the
+      // same repo with a different symbolName yields identical results).
+      const key = isTopic
+        ? `topic::${targetEndpoint.repo}`
+        : `${targetEndpoint.repo}::${targetEndpoint.symbolName}`;
       if (!visitedRepos.has(key)) {
         visitedRepos.add(key);
         queue.push({
           repoPath: targetEndpoint.repo,
           symbolName: targetEndpoint.symbolName,
           crossDepth: 1,
+          isTopic,
         });
       }
     }
 
-    // --- Phase 2+: cross-repo BFS ---
+    // --- Phase 2+: cross-repo BFS (layer-parallel) ---
+    // Process queue in layers grouped by crossDepth.  Items within the same
+    // layer are independent (no data dependency between sibling repos), so
+    // they can run concurrently.  Concurrency is capped at PARALLEL_LIMIT
+    // to stay within the lbug connection pool's MAX_POOL_SIZE budget.
+    const PARALLEL_LIMIT = 4; // leave 1 slot for the entry repo still in pool
+
     while (queue.length > 0) {
-      const item = queue.shift()!;
-      if (item.crossDepth > maxCrossDepth) {
+      // Drain current layer (all items at the same crossDepth)
+      const currentDepth = queue[0].crossDepth;
+      const layer: QueueItem[] = [];
+      while (queue.length > 0 && queue[0].crossDepth === currentDepth) {
+        layer.push(queue.shift()!);
+      }
+
+      if (currentDepth > maxCrossDepth) {
         truncated = true;
-        continue;
+        continue; // skip entire layer
       }
 
-      const regName = config.repos[item.repoPath];
-      if (!regName) {
-        skippedRepos.push(item.repoPath);
-        continue;
-      }
+      // Process layer items in parallel batches of PARALLEL_LIMIT
+      for (let batchStart = 0; batchStart < layer.length; batchStart += PARALLEL_LIMIT) {
+        const batch = layer.slice(batchStart, batchStart + PARALLEL_LIMIT);
 
-      let repoHandle: GroupRepoHandle;
-      try {
-        repoHandle = await deps.port.resolveRepo(regName);
-      } catch {
-        skippedRepos.push(item.repoPath);
-        continue;
-      }
-
-      // Init lbug
-      const dbPath = `${repoHandle.storagePath}/lbug`;
-      try {
-        await initLbug(repoHandle.id, dbPath);
-        if (!openedRepoIds.includes(repoHandle.id)) {
-          openedRepoIds.push(repoHandle.id);
-        }
-      } catch {
-        skippedRepos.push(item.repoPath);
-        continue;
-      }
-
-      // Resolve the target symbol by name in this repo's lbug
-      const targetSym = await resolveByName(repoHandle.id, item.symbolName);
-      if (!targetSym) {
-        logger.warn(
-          `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
+        const batchResults = await Promise.all(
+          batch.map((item) => processOneSegment(
+            item, config, deps, crossLinks, direction,
+            maxDepth, relationTypes, includeTests, minConfidence,
+            openedRepoIds,
+          )),
         );
-        skippedRepos.push(item.repoPath);
-        continue;
-      }
 
-      // BFS within this repo
-      const { nodes, visitedFilePaths } = await intraRepoBFS(
-        repoHandle.id,
-        [targetSym.id],
-        targetSym.filePath ? [targetSym.filePath] : [],
-        direction,
-        { maxDepth, relationTypes, includeTests, minConfidence },
-      );
-
-      // Find cross-repo hops via contracts.json
-      const crossHops = findCrossRepoHopsFromRegistry(
-        crossLinks, item.repoPath, visitedFilePaths, direction,
-      );
-
-      segments.push({
-        repo: regName,
-        repoPath: item.repoPath,
-        entrySymbolUid: targetSym.id,
-        nodes,
-        crossHops,
-      });
-
-      // Enqueue further cross-repo targets
-      for (const hop of crossHops) {
-        const nextEndpoint = direction === 'downstream' ? hop.to : hop.from;
-        const key = `${nextEndpoint.repo}::${nextEndpoint.symbolName}`;
-        if (!visitedRepos.has(key)) {
-          visitedRepos.add(key);
-          queue.push({
-            repoPath: nextEndpoint.repo,
-            symbolName: nextEndpoint.symbolName,
-            crossDepth: item.crossDepth + 1,
-          });
+        // Collect results and enqueue next-layer items (single-threaded, no race)
+        for (const result of batchResults) {
+          if (result.skipped) {
+            skippedRepos.push(result.repoPath);
+            continue;
+          }
+          if (result.segment) {
+            segments.push(result.segment);
+          }
+          // Enqueue further cross-repo targets for the NEXT layer
+          for (const hop of (result.segment?.crossHops ?? [])) {
+            const isTopicHop = hop.contractType === 'topic';
+            const nextEndpoint = isTopicHop
+              ? (direction === 'downstream' ? hop.from : hop.to)
+              : (direction === 'downstream' ? hop.to : hop.from);
+            // Same dedup strategy as Phase 1: topic hops dedup by repo only
+            const key = isTopicHop
+              ? `topic::${nextEndpoint.repo}`
+              : `${nextEndpoint.repo}::${nextEndpoint.symbolName}`;
+            if (!visitedRepos.has(key)) {
+              visitedRepos.add(key);
+              queue.push({
+                repoPath: nextEndpoint.repo,
+                symbolName: nextEndpoint.symbolName,
+                crossDepth: currentDepth + 1,
+                isTopic: isTopicHop,
+              });
+            }
+          }
         }
       }
     }

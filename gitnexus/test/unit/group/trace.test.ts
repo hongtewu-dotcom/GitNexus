@@ -202,8 +202,8 @@ describe('runGroupTrace', () => {
         { id: 'sym-1', name: 'myFunc', type: 'Function', filePath: 'src/main.ts' },
       ]);
 
-      // BFS query returns one neighbor
-      (executeQuery as any).mockResolvedValueOnce([
+      // BFS query returns one neighbor (now uses executeParameterized)
+      (executeParameterized as any).mockResolvedValueOnce([
         {
           sourceId: 'sym-1',
           id: 'sym-2',
@@ -215,7 +215,7 @@ describe('runGroupTrace', () => {
         },
       ]);
       // Next depth: no more neighbors
-      (executeQuery as any).mockResolvedValueOnce([]);
+      (executeParameterized as any).mockResolvedValueOnce([]);
 
       const port = makePort();
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
@@ -270,8 +270,8 @@ describe('runGroupTrace', () => {
         { id: 'be-sym-1', name: 'callFrontend', type: 'Function', filePath: 'src/client.ts' },
       ]);
 
-      // Entry repo BFS depth 1: no CALLS neighbors
-      (executeQuery as any).mockResolvedValueOnce([]);
+      // Entry repo BFS depth 1: no CALLS neighbors (now uses executeParameterized)
+      (executeParameterized as any).mockResolvedValueOnce([]);
 
       // Target repo: resolve symbol by name "FrontendService.handleRequest"
       (executeParameterized as any)
@@ -279,8 +279,8 @@ describe('runGroupTrace', () => {
           { id: 'fe-sym-1', name: 'handleRequest', type: 'Function', filePath: 'src/api.ts' },
         ]);
 
-      // Target repo BFS depth 1: one neighbor
-      (executeQuery as any).mockResolvedValueOnce([
+      // Target repo BFS depth 1: one neighbor (now uses executeParameterized)
+      (executeParameterized as any).mockResolvedValueOnce([
         {
           sourceId: 'fe-sym-1',
           id: 'fe-sym-2',
@@ -292,7 +292,7 @@ describe('runGroupTrace', () => {
         },
       ]);
       // Target repo BFS depth 2: no more
-      (executeQuery as any).mockResolvedValueOnce([]);
+      (executeParameterized as any).mockResolvedValueOnce([]);
 
       const port = makePort();
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
@@ -316,6 +316,220 @@ describe('runGroupTrace', () => {
       expect(trace.segments[1].repoPath).toBe('app/frontend');
       expect(trace.segments[1].nodes).toHaveLength(1);
       expect(trace.segments[1].nodes[0].name).toBe('processData');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('follows cross-repo hop via topic crossLink (MQ direction reversed)', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      // For MQ/topic crossLinks: from=consumer, to=producer.
+      // When tracing downstream from the producer (app/backend),
+      // the fix should match link.to.repo === currentRepo and jump to link.from.repo.
+      // symbolRef.name uses real mafka format: "mafkaConsumer(...)" / "mafkaProducer(...)"
+      // which won't exist in LadybugDB — the isTopic flag skips resolveByName.
+      writeContractsJson(groupDir, [
+        {
+          from: {
+            repo: 'app/frontend', // consumer
+            symbolUid: 'source-scan::topic::consumer::order_created',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaConsumer(order_created)' },
+          },
+          to: {
+            repo: 'app/backend', // producer
+            symbolUid: 'source-scan::topic::provider::order_created',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaProducer(order_created)' },
+          },
+          type: 'topic',
+          contractId: 'topic::order_created',
+          matchType: 'exact',
+          confidence: 1,
+        },
+      ]);
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      // Entry repo (app/backend): resolve entry symbol
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'be-producer', name: 'OrderCreatedProducer', type: 'Class', filePath: 'src/producer.ts' },
+      ]);
+
+      // Entry repo BFS depth 1: no CALLS neighbors
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      // Consumer repo (app/frontend): topic hop — resolveByName is SKIPPED.
+      // No mock needed for resolveByName. Only need empty BFS results won't be called either.
+      // The segment will have empty nodes but still be added.
+
+      const port = makePort();
+      const result = await runGroupTrace(makeDeps(port, tmpDir), {
+        name: 'g1',
+        repo: 'app/backend',
+        target: 'be-producer',
+        maxDepth: 3,
+        maxCrossDepth: 2,
+      });
+
+      expect(result).not.toHaveProperty('error');
+      const trace = result as TraceResult;
+      expect(trace.segments).toHaveLength(2);
+
+      // First segment: producer repo (app/backend)
+      expect(trace.segments[0].repoPath).toBe('app/backend');
+      expect(trace.segments[0].crossHops).toHaveLength(1);
+      expect(trace.segments[0].crossHops[0].contractId).toBe('topic::order_created');
+      expect(trace.segments[0].crossHops[0].contractType).toBe('topic');
+
+      // Second segment: consumer repo (app/frontend) — added via topic hop, no BFS
+      expect(trace.segments[1].repoPath).toBe('app/frontend');
+      expect(trace.segments[1].nodes).toHaveLength(0); // no BFS for topic hops
+      // Crucially: NOT in skippedRepos
+      expect(trace.skippedRepos).not.toContain('app/frontend');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('deduplicates multiple topic hops to the same target repo', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      // Two topic crossLinks from app/backend → app/frontend (different topics)
+      // Should produce only ONE segment for app/frontend (deduped by repo).
+      writeContractsJson(groupDir, [
+        {
+          from: {
+            repo: 'app/frontend',
+            symbolUid: 'source-scan::topic::consumer::topic_a',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaConsumer(topic_a)' },
+          },
+          to: {
+            repo: 'app/backend',
+            symbolUid: 'source-scan::topic::provider::topic_a',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaProducer(topic_a)' },
+          },
+          type: 'topic',
+          contractId: 'topic::topic_a',
+          matchType: 'exact',
+          confidence: 1,
+        },
+        {
+          from: {
+            repo: 'app/frontend',
+            symbolUid: 'source-scan::topic::consumer::topic_b',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaConsumer(topic_b)' },
+          },
+          to: {
+            repo: 'app/backend',
+            symbolUid: 'source-scan::topic::provider::topic_b',
+            symbolRef: { filePath: 'mafka.properties', name: 'mafkaProducer(topic_b)' },
+          },
+          type: 'topic',
+          contractId: 'topic::topic_b',
+          matchType: 'exact',
+          confidence: 1,
+        },
+      ]);
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      // Entry repo: resolve entry symbol
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'be-1', name: 'ProducerService', type: 'Class', filePath: 'src/producer.ts' },
+      ]);
+      // Entry repo BFS: no neighbors
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      const port = makePort();
+      const result = await runGroupTrace(makeDeps(port, tmpDir), {
+        name: 'g1',
+        repo: 'app/backend',
+        target: 'be-1',
+        maxDepth: 2,
+        maxCrossDepth: 2,
+      });
+
+      expect(result).not.toHaveProperty('error');
+      const trace = result as TraceResult;
+      // Should be exactly 2 segments: entry + ONE for app/frontend (not two)
+      expect(trace.segments).toHaveLength(2);
+      expect(trace.segments[1].repoPath).toBe('app/frontend');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('skips resolveByName for unresolvable synthetic symbol names', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      // RPC crossLink with a squirrel-style symbolName that won't exist in lbug
+      writeContractsJson(groupDir, [
+        {
+          from: {
+            repo: 'app/backend',
+            symbolUid: 'squirrel::consumer::fare.fd',
+            symbolRef: { filePath: 'src/cache.ts', name: 'squirrel.fare.fd.category.name' },
+          },
+          to: {
+            repo: 'app/frontend',
+            symbolUid: 'squirrel::provider::fare.fd',
+            symbolRef: { filePath: 'squirrel.properties', name: 'squirrel.fare.fd.category.name' },
+          },
+          type: 'custom',
+          contractId: 'custom::squirrel::fare.fd',
+          matchType: 'exact',
+          confidence: 0.8,
+        },
+      ]);
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      // Entry repo: resolve entry symbol
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'be-1', name: 'CacheService', type: 'Class', filePath: 'src/cache.ts' },
+      ]);
+      // Entry repo BFS depth 1: returns the file that matches crossLink
+      (executeParameterized as any).mockResolvedValueOnce([
+        {
+          sourceId: 'be-1',
+          id: 'be-2',
+          name: 'readCache',
+          type: 'Method',
+          filePath: 'src/cache.ts',
+          relType: 'CALLS',
+          confidence: 1,
+        },
+      ]);
+      // Entry repo BFS depth 2: no more
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      // Target repo: since symbolName is "squirrel.fare.fd.category.name",
+      // isUnresolvableSymbolName should return true → no lbug query fired →
+      // repo is skipped (returns null from resolveByName → skipped).
+
+      const port = makePort();
+      const result = await runGroupTrace(makeDeps(port, tmpDir), {
+        name: 'g1',
+        repo: 'app/backend',
+        target: 'be-1',
+        maxDepth: 3,
+        maxCrossDepth: 2,
+      });
+
+      expect(result).not.toHaveProperty('error');
+      const trace = result as TraceResult;
+      // Entry segment should have the crossHop
+      expect(trace.segments[0].crossHops).toHaveLength(1);
+      // Target repo should be SKIPPED (resolveByName returned null for unresolvable name)
+      expect(trace.skippedRepos).toContain('app/frontend');
+      // Only 1 segment (the entry repo)
+      expect(trace.segments).toHaveLength(1);
     } finally {
       cleanup();
     }
@@ -347,8 +561,8 @@ describe('runGroupTrace', () => {
         { id: 'sym-1', name: 'myFunc', type: 'Function', filePath: 'src/main.ts' },
       ]);
 
-      // BFS returns a test file neighbor
-      (executeQuery as any).mockResolvedValueOnce([
+      // BFS returns a test file neighbor (now uses executeParameterized)
+      (executeParameterized as any).mockResolvedValueOnce([
         {
           sourceId: 'sym-1',
           id: 'test-sym',

@@ -101,6 +101,29 @@ const PROVIDER_PATTERNS = compilePatterns({
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
+/**
+ * Detect Swift-style @ThriftService annotated interfaces as providers.
+ * These interfaces define Thrift service contracts without .thrift IDL files,
+ * using Java annotations instead (common in Meituan's MDP framework).
+ */
+const THRIFT_ANNOTATION_PROVIDER_PATTERNS = compilePatterns({
+  name: 'java-thrift-annotation-providers',
+  language: Java,
+  patterns: [
+    {
+      meta: {},
+      query: `
+        (interface_declaration
+          (modifiers
+            (marker_annotation
+              name: (identifier) @annotation))
+          name: (identifier) @iface_name
+          body: (interface_body) @body) @iface
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
 function serviceFromType(typeText: string): ServiceTypeMatch | null {
   const segments = typeText.split('.').filter((segment) => segment.length > 0);
   const last = segments.at(-1);
@@ -114,6 +137,17 @@ function serviceFromType(typeText: string): ServiceTypeMatch | null {
 }
 
 function methodNamesInClassBody(body: Parser.SyntaxNode): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < body.namedChildCount; i++) {
+    const child = body.namedChild(i);
+    if (!child || child.type !== 'method_declaration') continue;
+    const name = child.childForFieldName('name');
+    if (name?.text) names.push(name.text);
+  }
+  return names;
+}
+
+function methodNamesInInterfaceBody(body: Parser.SyntaxNode): string[] {
   const names: string[] = [];
   for (let i = 0; i < body.namedChildCount; i++) {
     const child = body.namedChild(i);
@@ -249,6 +283,34 @@ export const JAVA_THRIFT_PLUGIN: ThriftLanguagePlugin = {
           source: 'java_thrift_provider',
           confidenceWithIdl: 0.8,
           confidenceWithoutIdl: 0,
+        });
+      }
+    }
+
+    // Detect @ThriftService annotated interfaces as providers.
+    // These are Swift-style Thrift definitions where the Java interface itself
+    // IS the service contract (no .thrift IDL file, no generated Iface/Client).
+    const THRIFT_ANNOTATIONS = new Set(['ThriftService', 'ThriftMethod']);
+    for (const match of runCompiledPatterns(THRIFT_ANNOTATION_PROVIDER_PATTERNS, tree)) {
+      const annotationNode = match.captures.annotation;
+      const ifaceNameNode = match.captures.iface_name;
+      const bodyNode = match.captures.body;
+      if (!annotationNode || !ifaceNameNode || !bodyNode) continue;
+      if (!THRIFT_ANNOTATIONS.has(annotationNode.text)) continue;
+
+      const serviceName = ifaceNameNode.text;
+      for (const methodName of methodNamesInInterfaceBody(bodyNode)) {
+        const key = `${serviceName}.${methodName}`;
+        if (emittedProviders.has(key)) continue;
+        emittedProviders.add(key);
+        out.push({
+          role: 'provider',
+          serviceName,
+          methodName,
+          symbolName: `${serviceName}.${methodName}`,
+          source: 'java_thrift_annotation_provider',
+          confidenceWithIdl: 0,
+          confidenceWithoutIdl: 0.6,
         });
       }
     }

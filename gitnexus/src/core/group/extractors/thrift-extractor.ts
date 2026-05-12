@@ -352,19 +352,46 @@ export class ThriftExtractor implements ContractExtractor {
       );
     }
 
-    if (
-      detection.role !== 'consumer' ||
-      !detection.methodName ||
-      !detection.usesGeneratedServiceMember
-    ) {
+    if (!detection.methodName) {
       return null;
     }
+
+    // Provider fallback: @ThriftService annotated interfaces have no .thrift IDL,
+    // but are legitimate Thrift service definitions. Accept them with moderate confidence.
+    if (detection.role === 'provider') {
+      if (detection.source !== 'java_thrift_annotation_provider') {
+        return null;
+      }
+      return makeContract(
+        thriftMethodContractId('', detection.serviceName, detection.methodName),
+        detection.role,
+        filePath,
+        detection.symbolName,
+        detection.confidenceWithoutIdl,
+        {
+          service: detection.serviceName,
+          method: detection.methodName,
+          source: detection.source,
+        },
+      );
+    }
+
+    // Consumer fallback: Accept consumers that either use a generated member
+    // (e.g. SomeService.Iface) or whose service name looks like a Thrift service
+    // (e.g. *ThriftService, *Service). This covers Swift-style @ThriftService
+    // interfaces that don't have .thrift IDL files.
+    if (!detection.usesGeneratedServiceMember && !detection.serviceName.endsWith('Service')) {
+      return null;
+    }
+    const confidence = detection.usesGeneratedServiceMember
+      ? detection.confidenceWithoutIdl
+      : Math.max(detection.confidenceWithoutIdl, 0.35);
     return makeContract(
       thriftMethodContractId('', detection.serviceName, detection.methodName),
       detection.role,
       filePath,
       detection.symbolName,
-      detection.confidenceWithoutIdl,
+      confidence,
       {
         service: detection.serviceName,
         method: detection.methodName,
