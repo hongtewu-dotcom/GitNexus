@@ -334,6 +334,111 @@ function isUnresolvableSymbolName(symbolName: string): boolean {
   return false;
 }
 
+/**
+ * Tokenize a symbol name (PascalCase, camelCase, or snake_case) into lowercase tokens.
+ * "Event_report_listener" → ["event", "report", "listener"]
+ * "MOrderStatusChangeProcess" → ["m", "order", "status", "change", "process"]
+ * "OrderStatusListener" → ["order", "status", "listener"]
+ */
+function tokenizeSymbolName(name: string): string[] {
+  // Replace underscores with spaces, then split on PascalCase boundaries
+  const normalized = name.replace(/_/g, ' ');
+  const tokens = normalized
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/\s+/)
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length > 0);
+  return tokens;
+}
+
+/** Common suffixes to strip when comparing consumer/listener class names */
+const CONSUMER_NOISE_TOKENS = new Set([
+  'listener', 'consumer', 'process', 'processor', 'handler',
+  'service', 'impl', 'mafka', 'mq', 'kafka', 'abstract', 'base',
+]);
+
+/**
+ * Fuzzy-resolve a Mafka/MQ consumer class when the symbolName (from properties
+ * listenerId) doesn't match any node exactly. Searches for Class/Interface nodes
+ * in consumer/listener/mq directories and scores by token overlap.
+ */
+async function fuzzyResolveConsumerClass(
+  repoId: string,
+  symbolName: string,
+  findHandlerMethodInFile: (cls: { id: string; name: string; type: string; filePath: string }) => Promise<{ id: string; name: string; type: string; filePath: string }>,
+): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
+  // Tokenize input and remove noise tokens to get core business tokens
+  const inputTokens = tokenizeSymbolName(symbolName);
+  const coreTokens = inputTokens.filter((t) => !CONSUMER_NOISE_TOKENS.has(t));
+  if (coreTokens.length === 0) return null;
+
+  // Search for Class/Interface nodes in consumer/listener/mq directories.
+  // Note: Kùzu doesn't support labels(c)[0] = 'X' in WHERE clause reliably,
+  // so we filter by node ID prefix (which encodes the node type).
+  const candidates = await executeParameterized(
+    repoId,
+    `MATCH (c) WHERE (c.id STARTS WITH 'Class:' OR c.id STARTS WITH 'Interface:')
+     AND (c.filePath CONTAINS 'consumer' OR c.filePath CONTAINS 'Consumer'
+          OR c.filePath CONTAINS 'listener' OR c.filePath CONTAINS 'Listener'
+          OR c.filePath CONTAINS '/mq/' OR c.filePath CONTAINS 'mafka'
+          OR c.filePath CONTAINS 'Mafka')
+     AND NOT c.filePath CONTAINS 'test/'
+     AND NOT c.filePath CONTAINS 'Test'
+     RETURN c.id AS id, c.name AS name, c.filePath AS filePath`,
+    {},
+  );
+
+  if (candidates.length === 0) return null;
+
+  // Score each candidate by token overlap with core tokens
+  let bestScore = 0;
+  let bestCandidate: { id: string; name: string; type: string; filePath: string } | null = null;
+
+  for (const row of candidates) {
+    const candidateName = (row.name ?? row[1]) as string;
+    const candidateTokens = tokenizeSymbolName(candidateName)
+      .filter((t) => !CONSUMER_NOISE_TOKENS.has(t));
+
+    // Count matching core tokens (case-insensitive)
+    let matchCount = 0;
+    for (const ct of coreTokens) {
+      if (candidateTokens.includes(ct)) matchCount++;
+    }
+
+    // Score = matched / max(inputCore, candidateCore) to normalize
+    const score = matchCount / Math.max(coreTokens.length, candidateTokens.length || 1);
+
+    if (score > bestScore) {
+      bestScore = score;
+      const nodeId = (row.id ?? row[0]) as string;
+      bestCandidate = {
+        id: nodeId,
+        name: candidateName,
+        type: nodeId.startsWith('Class:') ? 'Class' : 'Interface',
+        filePath: (row.filePath ?? row[2]) as string,
+      };
+    }
+  }
+
+  // Require at least 40% token overlap to avoid false positives
+  if (!bestCandidate || bestScore < 0.4) {
+    logger.info(
+      `[trace] fuzzyResolveConsumerClass: no match for "${symbolName}" (best score=${bestScore.toFixed(2)}, ` +
+      `coreTokens=[${coreTokens.join(',')}], candidates=${candidates.length})`,
+    );
+    return null;
+  }
+
+  logger.info(
+    `[trace] fuzzyResolveConsumerClass: "${symbolName}" → "${bestCandidate.name}" ` +
+    `(score=${bestScore.toFixed(2)}, coreTokens=[${coreTokens.join(',')}])`,
+  );
+
+  // Drill down to handler method for BFS
+  return findHandlerMethodInFile(bestCandidate);
+}
+
 /** Resolve a symbol by name in a repo's lbug (for cross-repo entry).
  *
  * symbolName comes from contracts.json `to.symbolRef.name`, typically in
@@ -357,6 +462,36 @@ async function resolveByName(
     return null;
   }
 
+  // Well-known handler method names for Mafka/MQ consumer classes.
+  // When we resolve to a Class node, we prefer BFS from its handler method
+  // (which has CALLS edges) rather than the Class itself (which only has HAS_METHOD edges).
+  const handlerNames = new Set(['handleMessage', 'onRecvMessage', 'consume', 'onMessage', 'process', 'execute', 'run']);
+
+  /**
+   * Given a Class/Interface node, find its best handler Method for BFS seeding.
+   * Returns the Method node if found, otherwise the original class node.
+   */
+  async function findHandlerMethodInFile(
+    cls: { id: string; name: string; type: string; filePath: string },
+  ): Promise<{ id: string; name: string; type: string; filePath: string }> {
+    if (!cls.filePath) return cls;
+    const methods = await executeParameterized(
+      repoId,
+      `MATCH (m:Method) WHERE m.filePath = $fp
+       RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
+      { fp: cls.filePath },
+    );
+    if (methods.length === 0) return cls;
+    const handler = methods.find((m: Record<string, unknown>) => handlerNames.has((m.name ?? m[1]) as string));
+    const best = handler ?? methods[0];
+    return {
+      id: (best.id ?? best[0]) as string,
+      name: (best.name ?? best[1]) as string,
+      type: (best.type ?? best[2]) as string,
+      filePath: (best.filePath ?? best[3]) as string,
+    };
+  }
+
   // Try exact name match first (works when lbug stores qualified names)
   const rows = await executeParameterized(
     repoId,
@@ -367,21 +502,27 @@ async function resolveByName(
   );
   if (rows.length > 0) {
     const r = rows[0];
-    return {
-      id: r.id ?? r[0],
-      name: r.name ?? r[1],
-      type: r.type ?? r[2],
-      filePath: r.filePath ?? r[3],
+    const matched = {
+      id: (r.id ?? r[0]) as string,
+      name: (r.name ?? r[1]) as string,
+      type: (r.type ?? r[2]) as string,
+      filePath: (r.filePath ?? r[3]) as string,
     };
+    // If exact match is a Method node, return directly — it has CALLS edges.
+    // If it's a Class/Interface/Constructor, drill down to its handler method
+    // because BFS only follows CALLS edges (not HAS_METHOD).
+    const nodeId = matched.id;
+    if (nodeId.startsWith('Method:')) {
+      return matched;
+    }
+    // Class/Interface/Constructor — find the handler method in the same file
+    return findHandlerMethodInFile(matched);
   }
 
   // Extract class prefix and short method name
   const lastDot = symbolName.lastIndexOf('.');
   if (lastDot < 0) {
-    // No dot — treat as a class name. Find the first Method node declared in
-    // the same file as this class (typical entry points: handleMessage, consume,
-    // onRecvMessage, execute, process, run). This handles Mafka consumer beans
-    // where only the class name is known from properties configuration.
+    // No dot — treat as a class name. Find the Class node then its handler method.
     const classRow = await executeParameterized(
       repoId,
       `MATCH (c) WHERE c.name = $name
@@ -389,38 +530,24 @@ async function resolveByName(
        LIMIT 1`,
       { name: symbolName },
     );
-    if (classRow.length === 0) return null;
-    const cls = classRow[0];
-    const clsFilePath = (cls.filePath ?? cls[3]) as string;
-    if (!clsFilePath) return null;
-
-    // Look for a Method node in the same file — prefer well-known handler methods
-    const methods = await executeParameterized(
-      repoId,
-      `MATCH (m:Method) WHERE m.filePath = $fp
-       RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
-      { fp: clsFilePath },
-    );
-    if (methods.length === 0) {
-      // No methods — return the class node itself, BFS may still find CALLS
-      return {
+    if (classRow.length > 0) {
+      const cls = classRow[0];
+      const clsResult = {
         id: (cls.id ?? cls[0]) as string,
         name: (cls.name ?? cls[1]) as string,
         type: (cls.type ?? cls[2]) as string,
-        filePath: clsFilePath,
+        filePath: (cls.filePath ?? cls[3]) as string,
       };
+      return findHandlerMethodInFile(clsResult);
     }
 
-    // Prefer known consumer handler methods
-    const handlerNames = new Set(['handleMessage', 'onRecvMessage', 'consume', 'onMessage', 'process', 'execute', 'run']);
-    const handler = methods.find((m: Record<string, unknown>) => handlerNames.has((m.name ?? m[1]) as string));
-    const best = handler ?? methods[0];
-    return {
-      id: (best.id ?? best[0]) as string,
-      name: (best.name ?? best[1]) as string,
-      type: (best.type ?? best[2]) as string,
-      filePath: (best.filePath ?? best[3]) as string,
-    };
+    // Fuzzy fallback for Mafka/MQ bean names that don't match Java class names.
+    // Strategy: tokenize the symbolName, search for Class nodes in consumer/listener/mq
+    // directories, score by token overlap.
+    const fuzzyResult = await fuzzyResolveConsumerClass(repoId, symbolName, findHandlerMethodInFile);
+    if (fuzzyResult) return fuzzyResult;
+
+    return null;
   }
 
   const classPrefix = symbolName.slice(0, lastDot);   // e.g. "SecondCheckThriftService"
