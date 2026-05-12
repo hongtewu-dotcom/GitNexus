@@ -13,10 +13,25 @@ import type { ExtractedContract, RepoHandle } from '../types.js';
  *
  * Property patterns:
  *   mdp.mafka.consumers[N].topicName = <topic>
+ *   mdp.mafka.consumers[N].listenerId = <beanName>
  *   mdp.mafka.producers[N].topicName = <topic>
+ *
+ * When `listenerId` is present, it is used as the symbolName (PascalCase
+ * class name), enabling cross-repo resolution in LadybugDB. Otherwise
+ * falls back to the synthetic "mafkaConsumer(topic)" format.
  */
 
-const TOPIC_PATTERN = /^mdp\.mafka\.(consumers?|producers?)\[\d+\]\.topicName\s*=\s*(.+)$/;
+/** Matches any mdp.mafka.{role}[N].{prop} = {value} line */
+const PROP_PATTERN = /^mdp\.mafka\.(consumers?|producers?)\[(\d+)\]\.(\w+)\s*=\s*(.+)$/;
+
+/**
+ * Capitalize first letter: "otaEiChangeConsumer" → "OtaEiChangeConsumer".
+ * This maps the Spring Bean name (camelCase) to the Java class name (PascalCase).
+ */
+function capitalizeFirst(s: string): string {
+  if (!s) return s;
+  return s[0].toUpperCase() + s.slice(1);
+}
 
 function makeContract(
   topicName: string,
@@ -38,6 +53,12 @@ function makeContract(
       extractionStrategy: 'properties_scan',
     },
   };
+}
+
+interface MafkaEntry {
+  role: 'provider' | 'consumer';
+  topicName?: string;
+  listenerId?: string;
 }
 
 export class MafkaPropertiesExtractor implements ContractExtractor {
@@ -70,28 +91,59 @@ export class MafkaPropertiesExtractor implements ContractExtractor {
         continue;
       }
 
+      // Group properties by role+index → collect topicName + listenerId together
+      const entries = new Map<string, MafkaEntry>();
+
       for (const line of content.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) continue;
 
-        const match = TOPIC_PATTERN.exec(trimmed);
+        const match = PROP_PATTERN.exec(trimmed);
         if (!match) continue;
 
         const roleStr = match[1].toLowerCase();
-        const topicName = match[2].trim();
-        if (!topicName || topicName.startsWith('${')) continue;
+        const index = match[2];
+        const prop = match[3];
+        const value = match[4].trim();
 
         const role: 'provider' | 'consumer' = roleStr.startsWith('producer')
           ? 'provider'
           : 'consumer';
-        const key = `${topicName}|${role}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
+        const key = `${roleStr}[${index}]`;
 
-        const symbolName = role === 'provider'
-          ? `mafkaProducer(${topicName})`
-          : `mafkaConsumer(${topicName})`;
-        out.push(makeContract(topicName, role, rel, symbolName));
+        let entry = entries.get(key);
+        if (!entry) {
+          entry = { role };
+          entries.set(key, entry);
+        }
+
+        if (prop === 'topicName' && value && !value.startsWith('${')) {
+          entry.topicName = value;
+        } else if (prop === 'listenerId' && value) {
+          entry.listenerId = value;
+        }
+      }
+
+      // Emit contracts from grouped entries
+      for (const entry of entries.values()) {
+        if (!entry.topicName) continue;
+
+        const dedupeKey = `${entry.topicName}|${entry.role}`;
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+
+        // Use listenerId (PascalCase) as symbolName when available, enabling
+        // LadybugDB resolution. Fall back to synthetic format otherwise.
+        let symbolName: string;
+        if (entry.listenerId && entry.role === 'consumer') {
+          symbolName = capitalizeFirst(entry.listenerId);
+        } else if (entry.role === 'provider') {
+          symbolName = `mafkaProducer(${entry.topicName})`;
+        } else {
+          symbolName = `mafkaConsumer(${entry.topicName})`;
+        }
+
+        out.push(makeContract(entry.topicName, entry.role, rel, symbolName));
       }
     }
 

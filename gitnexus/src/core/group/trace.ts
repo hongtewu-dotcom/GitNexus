@@ -94,9 +94,9 @@ export interface TraceParams {
   target: string;
   /** Trace direction — defaults to 'downstream'. */
   direction?: 'downstream' | 'upstream';
-  /** Max BFS depth within each repo (default 5). */
+  /** Max BFS depth within each repo. 0 = unlimited (BFS runs until frontier is empty). Default: 0. */
   maxDepth?: number;
-  /** Max cross-repo hops (default 3). */
+  /** Max cross-repo hops. 0 = unlimited. Default: 10. */
   maxCrossDepth?: number;
   /** Relation types for BFS edges (default: CALLS). */
   relationTypes?: string[];
@@ -119,8 +119,8 @@ export interface TraceDeps {
 // Defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_MAX_DEPTH = 12;
-const DEFAULT_MAX_CROSS_DEPTH = 5;
+const DEFAULT_MAX_DEPTH = 0; // 0 = unlimited (BFS terminates when frontier is empty)
+const DEFAULT_MAX_CROSS_DEPTH = 10;
 const DEFAULT_RELATION_TYPES = ['CALLS'];
 
 // ---------------------------------------------------------------------------
@@ -377,7 +377,51 @@ async function resolveByName(
 
   // Extract class prefix and short method name
   const lastDot = symbolName.lastIndexOf('.');
-  if (lastDot < 0) return null; // no dot → nothing more to try
+  if (lastDot < 0) {
+    // No dot — treat as a class name. Find the first Method node declared in
+    // the same file as this class (typical entry points: handleMessage, consume,
+    // onRecvMessage, execute, process, run). This handles Mafka consumer beans
+    // where only the class name is known from properties configuration.
+    const classRow = await executeParameterized(
+      repoId,
+      `MATCH (c) WHERE c.name = $name
+       RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
+       LIMIT 1`,
+      { name: symbolName },
+    );
+    if (classRow.length === 0) return null;
+    const cls = classRow[0];
+    const clsFilePath = (cls.filePath ?? cls[3]) as string;
+    if (!clsFilePath) return null;
+
+    // Look for a Method node in the same file — prefer well-known handler methods
+    const methods = await executeParameterized(
+      repoId,
+      `MATCH (m:Method) WHERE m.filePath = $fp
+       RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
+      { fp: clsFilePath },
+    );
+    if (methods.length === 0) {
+      // No methods — return the class node itself, BFS may still find CALLS
+      return {
+        id: (cls.id ?? cls[0]) as string,
+        name: (cls.name ?? cls[1]) as string,
+        type: (cls.type ?? cls[2]) as string,
+        filePath: clsFilePath,
+      };
+    }
+
+    // Prefer known consumer handler methods
+    const handlerNames = new Set(['handleMessage', 'onRecvMessage', 'consume', 'onMessage', 'process', 'execute', 'run']);
+    const handler = methods.find((m: Record<string, unknown>) => handlerNames.has((m.name ?? m[1]) as string));
+    const best = handler ?? methods[0];
+    return {
+      id: (best.id ?? best[0]) as string,
+      name: (best.name ?? best[1]) as string,
+      type: (best.type ?? best[2]) as string,
+      filePath: (best.filePath ?? best[3]) as string,
+    };
+  }
 
   const classPrefix = symbolName.slice(0, lastDot);   // e.g. "SecondCheckThriftService"
   const shortName = symbolName.slice(lastDot + 1);     // e.g. "secondCheck"
@@ -453,7 +497,7 @@ async function intraRepoBFS(
   let frontier = [...seedIds];
   const nodes: TraceNode[] = [];
 
-  for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+  for (let depth = 1; (maxDepth === 0 || depth <= maxDepth) && frontier.length > 0; depth++) {
     // Use parameterized query to avoid isWriteQuery false positives when
     // node IDs contain keywords like CREATE, SET, DELETE, etc.
     const query =
@@ -694,10 +738,35 @@ async function processOneSegment(
     let visitedFilePaths: Set<string> = new Set();
     let entrySymbolUid = item.symbolName; // fallback for topic hops
 
-    if (item.isTopic) {
-      // Topic hop: no BFS possible (no entry symbol), but still discover crossHops
+    if (item.isTopic && !isUnresolvableSymbolName(item.symbolName)) {
+      // Topic hop WITH a real method/class name (from enriched TopicExtractor).
+      // Attempt to resolve and BFS like a normal RPC hop. If resolution fails,
+      // fall back to the empty-segment behaviour (still discover crossHops).
+      const targetSym = await resolveByName(repoHandle.id, item.symbolName);
+      if (targetSym) {
+        logger.info(
+          `[trace] topic hop resolved "${item.symbolName}" in "${item.repoPath}" → BFS from ${targetSym.id}`,
+        );
+        entrySymbolUid = targetSym.id;
+        const bfsResult = await intraRepoBFS(
+          repoHandle.id,
+          [targetSym.id],
+          targetSym.filePath ? [targetSym.filePath] : [],
+          direction,
+          { maxDepth, relationTypes, includeTests, minConfidence },
+        );
+        nodes = bfsResult.nodes;
+        visitedFilePaths = bfsResult.visitedFilePaths;
+      } else {
+        logger.info(
+          `[trace] topic hop to repo "${item.repoPath}" — "${item.symbolName}" not found in lbug, empty segment`,
+        );
+      }
+    } else if (item.isTopic) {
+      // Topic hop with unresolvable symbol name (e.g. "mafkaConsumer(topicName)")
+      // — no BFS possible, but still discover crossHops at repo level
       logger.info(
-        `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName, will discover crossHops at repo level`,
+        `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName for "${item.symbolName}"`,
       );
     } else {
       const targetSym = await resolveByName(repoHandle.id, item.symbolName);
@@ -898,7 +967,7 @@ export async function runGroupTrace(
       layer.push(queue.shift()!);
     }
 
-    if (currentDepth > maxCrossDepth) {
+    if (maxCrossDepth > 0 && currentDepth > maxCrossDepth) {
       truncated = true;
       continue; // skip entire layer
     }
@@ -976,13 +1045,18 @@ export async function runGroupTrace(
     }
   }
 
+  // Filter out repos that actually produced segments (avoid false "skipped" reports
+  // when a repo is entered multiple times with different symbols — some succeed, some fail).
+  const reposWithSegments = new Set(segments.map((s) => s.repoPath));
+  const actuallySkipped = [...new Set(skippedRepos)].filter((r) => !reposWithSegments.has(r));
+
   return {
     group: name,
     entryRepo: entryRepoPath,
     entryTarget: target,
     direction,
     segments,
-    skippedRepos: [...new Set(skippedRepos)],
+    skippedRepos: actuallySkipped,
     truncated,
   };
 }
