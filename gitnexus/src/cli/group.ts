@@ -383,8 +383,8 @@ export function registerGroupCommands(program: Command): void {
       'Member path from group.yaml (e.g. app/backend)',
     )
     .option('--direction <dir>', 'downstream or upstream', 'downstream')
-    .option('--max-depth <n>', 'Max BFS depth within each repo', '5')
-    .option('--max-cross-depth <n>', 'Max cross-repo hops', '3')
+    .option('--max-depth <n>', 'Max BFS depth within each repo (0=unlimited)', '0')
+    .option('--max-cross-depth <n>', 'Max cross-repo hops (0=unlimited)', '10')
     .option('--relation-types <types>', 'Comma-separated relation types (default: CALLS)', 'CALLS')
     .option('--min-confidence <n>', 'Minimum edge confidence (0–1)', '0')
     .option('--include-tests', 'Include test files in traversal', false)
@@ -396,8 +396,8 @@ export function registerGroupCommands(program: Command): void {
       try {
         await backend.init();
 
-        const maxDepth = parseInt(String(opts.maxDepth ?? '5'), 10) || 5;
-        const maxCrossDepth = parseInt(String(opts.maxCrossDepth ?? '3'), 10) || 3;
+        const maxDepth = parseInt(String(opts.maxDepth ?? '0'), 10);
+        const maxCrossDepth = parseInt(String(opts.maxCrossDepth ?? '10'), 10);
         const minConfidence = parseFloat(String(opts.minConfidence ?? '0')) || 0;
         const relationTypes = String(opts.relationTypes ?? 'CALLS')
           .split(',')

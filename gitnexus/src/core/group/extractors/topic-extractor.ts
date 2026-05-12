@@ -13,6 +13,44 @@ import {
 } from './topic-patterns/index.js';
 
 /**
+ * Walk up the AST parent chain from `startNode` looking for the enclosing
+ * method and class declarations. Returns "ClassName.methodName" if both are
+ * found, or partial forms ("ClassName" / "methodName") if only one is.
+ * Returns `null` when neither is reachable.
+ */
+function resolveEnclosingSymbol(startNode: Parser.SyntaxNode): string | null {
+  let methodName: string | null = null;
+  let className: string | null = null;
+  let current: Parser.SyntaxNode | null = startNode;
+
+  while (current) {
+    if (
+      !methodName &&
+      (current.type === 'method_declaration' || current.type === 'function_declaration')
+    ) {
+      const nameNode = current.childForFieldName('name');
+      if (nameNode) methodName = nameNode.text;
+    }
+    if (
+      !className &&
+      (current.type === 'class_declaration' ||
+        current.type === 'interface_declaration' ||
+        current.type === 'enum_declaration')
+    ) {
+      const nameNode = current.childForFieldName('name');
+      if (nameNode) className = nameNode.text;
+    }
+    if (methodName && className) break;
+    current = current.parent;
+  }
+
+  if (className && methodName) return `${className}.${methodName}`;
+  if (className) return className;
+  if (methodName) return methodName;
+  return null;
+}
+
+/**
  * Language-agnostic orchestrator for topic (message broker) contract
  * extraction. All grammar-specific knowledge lives in `topic-patterns/*`
  * — this file must not import any tree-sitter grammar directly.
@@ -93,7 +131,16 @@ export class TopicExtractor implements ContractExtractor {
         if (!valueNode) continue;
         const topicName = unquoteLiteral(valueNode.text);
         if (!topicName) continue;
-        out.push(makeContract(topicName, match.meta, rel));
+
+        // Enrich meta with actual enclosing method/class name from the AST.
+        // This allows cross-repo hops to resolve the consumer method in LadybugDB
+        // instead of producing an unresolvable "mafkaConsumer(topic)" symbol.
+        const enclosing = resolveEnclosingSymbol(valueNode);
+        const enrichedMeta: TopicMeta = enclosing
+          ? { ...match.meta, symbolName: enclosing }
+          : match.meta;
+
+        out.push(makeContract(topicName, enrichedMeta, rel));
       }
     }
 

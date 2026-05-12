@@ -225,6 +225,7 @@ export async function buildThriftContext(repoPath: string): Promise<ThriftContex
     ignore: ['**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**'],
     ignore: [
       '**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**',
+      '**/target/**',
       '**/src/test/**', '**/src/it/**', '**/test/**', '**/tests/**',
     ],
   });
