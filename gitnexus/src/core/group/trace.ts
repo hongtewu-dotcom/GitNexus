@@ -501,9 +501,60 @@ async function intraRepoBFS(
   return { nodes, visitedIds: [...visited], visitedFilePaths };
 }
 
+// ---------------------------------------------------------------------------
+// CrossLinks index — pre-built once per trace for O(1) repo lookup
+// ---------------------------------------------------------------------------
+
+/**
+ * Pre-indexed crossLinks grouped by (repo, direction-role).
+ * For each repo, stores the subset of crossLinks where that repo is the
+ * "local endpoint" (the side that matches during hop discovery).
+ */
+interface CrossLinksIndex {
+  /** downstream RPC: from.repo → links[] */
+  downstreamRpc: Map<string, CrossLink[]>;
+  /** upstream RPC: to.repo → links[] */
+  upstreamRpc: Map<string, CrossLink[]>;
+  /** downstream topic: to.repo → links[] (producer side) */
+  downstreamTopic: Map<string, CrossLink[]>;
+  /** upstream topic: from.repo → links[] (consumer side) */
+  upstreamTopic: Map<string, CrossLink[]>;
+}
+
+function buildCrossLinksIndex(crossLinks: CrossLink[]): CrossLinksIndex {
+  const idx: CrossLinksIndex = {
+    downstreamRpc: new Map(),
+    upstreamRpc: new Map(),
+    downstreamTopic: new Map(),
+    upstreamTopic: new Map(),
+  };
+  for (const link of crossLinks) {
+    if (link.type === 'topic') {
+      // downstream topic: producer(to) is local → consumer(from) is remote
+      const dtKey = link.to.repo;
+      if (!idx.downstreamTopic.has(dtKey)) idx.downstreamTopic.set(dtKey, []);
+      idx.downstreamTopic.get(dtKey)!.push(link);
+      // upstream topic: consumer(from) is local → producer(to) is remote
+      const utKey = link.from.repo;
+      if (!idx.upstreamTopic.has(utKey)) idx.upstreamTopic.set(utKey, []);
+      idx.upstreamTopic.get(utKey)!.push(link);
+    } else {
+      // downstream RPC: consumer(from) is local → provider(to) is remote
+      const drKey = link.from.repo;
+      if (!idx.downstreamRpc.has(drKey)) idx.downstreamRpc.set(drKey, []);
+      idx.downstreamRpc.get(drKey)!.push(link);
+      // upstream RPC: provider(to) is local → consumer(from) is remote
+      const urKey = link.to.repo;
+      if (!idx.upstreamRpc.has(urKey)) idx.upstreamRpc.set(urKey, []);
+      idx.upstreamRpc.get(urKey)!.push(link);
+    }
+  }
+  return idx;
+}
+
 /**
  * Find cross-repo hops by matching BFS-visited file paths against
- * contracts.json crossLinks.
+ * contracts.json crossLinks (using pre-built index).
  *
  * For RPC (thrift/http/grpc):
  *   - downstream: from.repo == currentRepo (consumer calls provider)
@@ -520,7 +571,7 @@ async function intraRepoBFS(
  * only the first hop per target repo per topic contractId.
  */
 function findCrossRepoHopsFromRegistry(
-  crossLinks: CrossLink[],
+  crossLinksIndex: CrossLinksIndex,
   repoPath: string,
   visitedFilePaths: Set<string>,
   direction: 'downstream' | 'upstream',
@@ -528,35 +579,23 @@ function findCrossRepoHopsFromRegistry(
   const hops: TraceCrossHop[] = [];
   const seen = new Set<string>();
 
-  for (const link of crossLinks) {
-    // For topic/MQ contracts, data flow is reversed relative to the
-    // consumer→provider convention used by RPC contracts.
-    // In crossLinks: from=consumer, to=provider.
-    // For RPC downstream: consumer(from) in current repo → jump to provider(to).
-    // For MQ downstream: producer(to) in current repo → jump to consumer(from).
-    const isTopic = link.type === 'topic';
-    const effectiveDirection = isTopic
-      ? (direction === 'downstream' ? 'upstream' : 'downstream')
-      : direction;
+  // Gather only the links relevant to this repo+direction from the pre-built index
+  const rpcLinks = direction === 'downstream'
+    ? (crossLinksIndex.downstreamRpc.get(repoPath) ?? [])
+    : (crossLinksIndex.upstreamRpc.get(repoPath) ?? []);
+  const topicLinks = direction === 'downstream'
+    ? (crossLinksIndex.downstreamTopic.get(repoPath) ?? [])
+    : (crossLinksIndex.upstreamTopic.get(repoPath) ?? []);
 
-    const localEndpoint = effectiveDirection === 'downstream' ? link.from : link.to;
-    const remoteEndpoint = effectiveDirection === 'downstream' ? link.to : link.from;
+  // Process RPC links
+  for (const link of rpcLinks) {
+    const localEndpoint = direction === 'downstream' ? link.from : link.to;
+    const remoteEndpoint = direction === 'downstream' ? link.to : link.from;
 
-    // Must match current repo
-    if (localEndpoint.repo !== repoPath) continue;
-    // Skip self-links
-    if (remoteEndpoint.repo === repoPath) continue;
-    // For topic/MQ: match at repo level (producer/consumer declarations live in
-    // config files like mafka.properties, not in the code call graph).
-    // For RPC: require a visited file path from BFS traversal.
-    if (!isTopic && !visitedFilePaths.has(localEndpoint.symbolRef.filePath)) continue;
+    if (remoteEndpoint.repo === repoPath) continue; // skip self-links
+    if (!visitedFilePaths.has(localEndpoint.symbolRef.filePath)) continue;
 
-    // Dedup key: for topic hops, dedup by (contractId, targetRepo) to collapse
-    // multiple consumer groups in the same target repo into one hop.
-    // For RPC, keep the existing (contractId, sourceRepo->targetRepo) dedup.
-    const key = isTopic
-      ? `topic::${link.contractId}::${remoteEndpoint.repo}`
-      : `${link.contractId}::${repoPath}->${remoteEndpoint.repo}`;
+    const key = `${link.contractId}::${repoPath}->${remoteEndpoint.repo}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -565,16 +604,28 @@ function findCrossRepoHopsFromRegistry(
       contractType: link.type,
       matchType: link.matchType,
       linkConfidence: link.confidence,
-      from: {
-        repo: link.from.repo,
-        symbolUid: link.from.symbolUid,
-        symbolName: link.from.symbolRef.name,
-      },
-      to: {
-        repo: link.to.repo,
-        symbolUid: link.to.symbolUid,
-        symbolName: link.to.symbolRef.name,
-      },
+      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name },
+      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name },
+    });
+  }
+
+  // Process topic/MQ links (match at repo level, no file path check)
+  for (const link of topicLinks) {
+    const remoteEndpoint = direction === 'downstream' ? link.from : link.to;
+
+    if (remoteEndpoint.repo === repoPath) continue; // skip self-links
+
+    const key = `topic::${link.contractId}::${remoteEndpoint.repo}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    hops.push({
+      contractId: link.contractId,
+      contractType: link.type,
+      matchType: link.matchType,
+      linkConfidence: link.confidence,
+      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name },
+      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name },
     });
   }
 
@@ -595,15 +646,14 @@ interface SegmentResult {
 
 /**
  * Process a single cross-repo segment: resolve repo → init lbug → resolve
- * symbol → BFS → find crossHops.  Pure function of its inputs (no shared
- * mutable state except openedRepoIds which is append-only and safe in JS
- * single-threaded Promise.all).
+ * symbol → BFS → find crossHops.  Does NOT close lbug — caller manages
+ * pool lifecycle via openedRepoIds.
  */
 async function processOneSegment(
   item: QueueItem,
   config: GroupConfig,
   deps: TraceDeps,
-  crossLinks: CrossLink[],
+  crossLinksIndex: CrossLinksIndex,
   direction: 'downstream' | 'upstream',
   maxDepth: number,
   relationTypes: string[],
@@ -634,59 +684,66 @@ async function processOneSegment(
     return { repoPath: item.repoPath, skipped: true };
   }
 
-  // Resolve the target symbol by name in this repo's lbug.
-  // For topic/MQ hops, symbolName is "mafkaConsumer(...)" or "mafkaProducer(...)"
-  // which won't exist in LadybugDB (it stores Java symbols). In that case we
-  // skip resolveByName and still add the repo as a segment (with empty nodes)
-  // so we can discover further crossHops from this repo.
-  let nodes: TraceNode[] = [];
-  let visitedFilePaths: Set<string> = new Set();
-  let entrySymbolUid = item.symbolName; // fallback for topic hops
+  try {
+    // Resolve the target symbol by name in this repo's lbug.
+    // For topic/MQ hops, symbolName is "mafkaConsumer(...)" or "mafkaProducer(...)"
+    // which won't exist in LadybugDB (it stores Java symbols). In that case we
+    // skip resolveByName and still add the repo as a segment (with empty nodes)
+    // so we can discover further crossHops from this repo.
+    let nodes: TraceNode[] = [];
+    let visitedFilePaths: Set<string> = new Set();
+    let entrySymbolUid = item.symbolName; // fallback for topic hops
 
-  if (item.isTopic) {
-    // Topic hop: no BFS possible (no entry symbol), but still discover crossHops
-    logger.info(
-      `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName, will discover crossHops at repo level`,
-    );
-  } else {
-    const targetSym = await resolveByName(repoHandle.id, item.symbolName);
-    if (!targetSym) {
-      logger.warn(
-        `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
+    if (item.isTopic) {
+      // Topic hop: no BFS possible (no entry symbol), but still discover crossHops
+      logger.info(
+        `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName, will discover crossHops at repo level`,
       );
-      return { repoPath: item.repoPath, skipped: true };
+    } else {
+      const targetSym = await resolveByName(repoHandle.id, item.symbolName);
+      if (!targetSym) {
+        logger.warn(
+          `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
+        );
+        return { repoPath: item.repoPath, skipped: true };
+      }
+
+      entrySymbolUid = targetSym.id;
+
+      // BFS within this repo
+      const bfsResult = await intraRepoBFS(
+        repoHandle.id,
+        [targetSym.id],
+        targetSym.filePath ? [targetSym.filePath] : [],
+        direction,
+        { maxDepth, relationTypes, includeTests, minConfidence },
+      );
+      nodes = bfsResult.nodes;
+      visitedFilePaths = bfsResult.visitedFilePaths;
     }
 
-    entrySymbolUid = targetSym.id;
-
-    // BFS within this repo
-    const bfsResult = await intraRepoBFS(
-      repoHandle.id,
-      [targetSym.id],
-      targetSym.filePath ? [targetSym.filePath] : [],
-      direction,
-      { maxDepth, relationTypes, includeTests, minConfidence },
+    // Find cross-repo hops via pre-built index
+    const crossHops = findCrossRepoHopsFromRegistry(
+      crossLinksIndex, item.repoPath, visitedFilePaths, direction,
     );
-    nodes = bfsResult.nodes;
-    visitedFilePaths = bfsResult.visitedFilePaths;
-  }
 
-  // Find cross-repo hops via contracts.json
-  const crossHops = findCrossRepoHopsFromRegistry(
-    crossLinks, item.repoPath, visitedFilePaths, direction,
-  );
-
-  return {
-    repoPath: item.repoPath,
-    skipped: false,
-    segment: {
-      repo: regName,
+    return {
       repoPath: item.repoPath,
-      entrySymbolUid,
-      nodes,
-      crossHops,
-    },
-  };
+      skipped: false,
+      segment: {
+        repo: regName,
+        repoPath: item.repoPath,
+        entrySymbolUid,
+        nodes,
+        crossHops,
+      },
+    };
+  } finally {
+    // Don't close here — trace maintains all opened repos until runGroupTrace
+    // completes, then closes them all. LRU eviction handles pool pressure
+    // (MAX_POOL_SIZE=5). Some segments may lose their pool entry mid-BFS,
+    // causing partial traversal (warn + break) which is acceptable.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,12 +792,13 @@ export async function runGroupTrace(
     return { error: e instanceof Error ? e.message : String(e) };
   }
 
-  // Load contracts.json for cross-repo lookups
+  // Load contracts.json for cross-repo lookups and build index
   const registry = await readContractRegistry(groupDir);
   const crossLinks = registry?.crossLinks ?? [];
   if (crossLinks.length === 0) {
     logger.warn(`[trace] No crossLinks in contracts.json for group "${name}". Cross-repo hops disabled.`);
   }
+  const crossLinksIndex = buildCrossLinksIndex(crossLinks);
 
   // Resolve entry repo
   const entryRegistryName = config.repos[entryRepoPath];
@@ -764,102 +822,122 @@ export async function runGroupTrace(
   // Queue: each item is a (repoPath, symbolName) to trace into
   const queue: QueueItem[] = [];
 
-  // --- Phase 1: entry repo ---
+  // Track all opened repos for cleanup at end of trace
   const openedRepoIds: string[] = [];
+
   try {
-    // Init lbug for entry repo
-    const entryDbPath = `${entryRepo.storagePath}/lbug`;
-    await initLbug(entryRepo.id, entryDbPath);
-    openedRepoIds.push(entryRepo.id);
+  // --- Phase 1: entry repo ---
+  const entryDbPath = `${entryRepo.storagePath}/lbug`;
+  await initLbug(entryRepo.id, entryDbPath);
+  openedRepoIds.push(entryRepo.id);
 
-    // Resolve entry symbol
-    const entrySym = await resolveEntrySymbol(entryRepo.id, target);
-    if (!entrySym) {
-      return { error: `Symbol "${target}" not found in repo "${entryRepoPath}".` };
+  // Resolve entry symbol
+  const entrySym = await resolveEntrySymbol(entryRepo.id, target);
+  if (!entrySym) {
+    return { error: `Symbol "${target}" not found in repo "${entryRepoPath}".` };
+  }
+
+  // BFS within entry repo
+  const bfsResult = await intraRepoBFS(
+    entryRepo.id,
+    [entrySym.id],
+    entrySym.filePath ? [entrySym.filePath] : [],
+    direction,
+    { maxDepth, relationTypes, includeTests, minConfidence },
+  );
+  const entryNodes = bfsResult.nodes;
+  const entryVisitedFilePaths = bfsResult.visitedFilePaths;
+
+  // Find cross-repo hops via pre-built index
+  const entryCrossHops = findCrossRepoHopsFromRegistry(
+    crossLinksIndex, entryRepoPath, entryVisitedFilePaths, direction,
+  );
+
+  segments.push({
+    repo: entryRegistryName,
+    repoPath: entryRepoPath,
+    entrySymbolUid: entrySym.id,
+    nodes: entryNodes,
+    crossHops: entryCrossHops,
+  });
+
+  // Enqueue cross-repo targets
+  for (const hop of entryCrossHops) {
+    const isTopic = hop.contractType === 'topic';
+    const targetEndpoint = isTopic
+      ? (direction === 'downstream' ? hop.from : hop.to)
+      : (direction === 'downstream' ? hop.to : hop.from);
+    const key = isTopic
+      ? `topic::${targetEndpoint.repo}`
+      : `${targetEndpoint.repo}::${targetEndpoint.symbolName}`;
+    if (!visitedRepos.has(key)) {
+      visitedRepos.add(key);
+      queue.push({
+        repoPath: targetEndpoint.repo,
+        symbolName: targetEndpoint.symbolName,
+        crossDepth: 1,
+        isTopic,
+      });
+    }
+  }
+
+  // --- Phase 2+: cross-repo BFS (layer-parallel) ---
+  // Process segments in parallel batches. PARALLEL_LIMIT=4 leaves 1 pool
+  // slot for the entry repo (still in pool from Phase 1). LRU eviction
+  // may close idle repos mid-BFS (causing partial traversal at deeper
+  // depths) but this is tolerable — the main speedup comes from:
+  //   1. CrossLinks index: O(1) repo lookup vs O(N=2354) full scan
+  //   2. Parallelism: 4 segments BFS concurrently
+  const PARALLEL_LIMIT = 4;
+
+  while (queue.length > 0) {
+    // Drain current layer (all items at the same crossDepth)
+    const currentDepth = queue[0].crossDepth;
+    const layer: QueueItem[] = [];
+    while (queue.length > 0 && queue[0].crossDepth === currentDepth) {
+      layer.push(queue.shift()!);
     }
 
-    // BFS within entry repo
-    const { nodes, visitedFilePaths } = await intraRepoBFS(
-      entryRepo.id,
-      [entrySym.id],
-      entrySym.filePath ? [entrySym.filePath] : [],
-      direction,
-      { maxDepth, relationTypes, includeTests, minConfidence },
-    );
-
-    // Find cross-repo hops via contracts.json
-    const crossHops = findCrossRepoHopsFromRegistry(
-      crossLinks, entryRepoPath, visitedFilePaths, direction,
-    );
-
-    segments.push({
-      repo: entryRegistryName,
-      repoPath: entryRepoPath,
-      entrySymbolUid: entrySym.id,
-      nodes,
-      crossHops,
-    });
-
-    // Enqueue cross-repo targets
-    for (const hop of crossHops) {
-      // For topic/MQ: data flows from producer(to) → consumer(from),
-      // so downstream target is hop.from (consumer), upstream target is hop.to (producer).
-      // For RPC: downstream target is hop.to (provider), upstream target is hop.from (consumer).
-      const isTopic = hop.contractType === 'topic';
-      const targetEndpoint = isTopic
-        ? (direction === 'downstream' ? hop.from : hop.to)
-        : (direction === 'downstream' ? hop.to : hop.from);
-      // For topic hops, dedup by repo only (BFS is skipped anyway, and
-      // findCrossRepoHopsFromRegistry is repo-level, so re-entering the
-      // same repo with a different symbolName yields identical results).
-      const key = isTopic
-        ? `topic::${targetEndpoint.repo}`
-        : `${targetEndpoint.repo}::${targetEndpoint.symbolName}`;
-      if (!visitedRepos.has(key)) {
-        visitedRepos.add(key);
-        queue.push({
-          repoPath: targetEndpoint.repo,
-          symbolName: targetEndpoint.symbolName,
-          crossDepth: 1,
-          isTopic,
-        });
-      }
+    if (currentDepth > maxCrossDepth) {
+      truncated = true;
+      continue; // skip entire layer
     }
 
-    // --- Phase 2+: cross-repo BFS (layer-parallel) ---
-    // Process queue in layers grouped by crossDepth.  Items within the same
-    // layer are independent (no data dependency between sibling repos), so
-    // they can run concurrently.  Concurrency is capped at PARALLEL_LIMIT
-    // to stay within the lbug connection pool's MAX_POOL_SIZE budget.
-    const PARALLEL_LIMIT = 4; // leave 1 slot for the entry repo still in pool
+    // Group layer items by repoPath to batch-process same-repo items together.
+    // This avoids redundant initLbug/eviction cycles: all items for a given
+    // repo share one init, and different repo-groups run in parallel batches.
+    const repoGroups = new Map<string, QueueItem[]>();
+    for (const item of layer) {
+      const existing = repoGroups.get(item.repoPath);
+      if (existing) existing.push(item);
+      else repoGroups.set(item.repoPath, [item]);
+    }
+    const groupKeys = [...repoGroups.keys()];
 
-    while (queue.length > 0) {
-      // Drain current layer (all items at the same crossDepth)
-      const currentDepth = queue[0].crossDepth;
-      const layer: QueueItem[] = [];
-      while (queue.length > 0 && queue[0].crossDepth === currentDepth) {
-        layer.push(queue.shift()!);
-      }
+    // Process repo-groups in parallel batches of PARALLEL_LIMIT.
+    // Each group may contain multiple items for the same repo — they are
+    // processed sequentially within the group (single init, multiple BFS).
+    for (let batchStart = 0; batchStart < groupKeys.length; batchStart += PARALLEL_LIMIT) {
+      const batchKeys = groupKeys.slice(batchStart, batchStart + PARALLEL_LIMIT);
 
-      if (currentDepth > maxCrossDepth) {
-        truncated = true;
-        continue; // skip entire layer
-      }
+      const batchResults = await Promise.all(
+        batchKeys.map(async (repoPath) => {
+          const items = repoGroups.get(repoPath)!;
+          const results: SegmentResult[] = [];
+          for (const item of items) {
+            results.push(await processOneSegment(
+              item, config, deps, crossLinksIndex, direction,
+              maxDepth, relationTypes, includeTests, minConfidence,
+              openedRepoIds,
+            ));
+          }
+          return results;
+        }),
+      );
 
-      // Process layer items in parallel batches of PARALLEL_LIMIT
-      for (let batchStart = 0; batchStart < layer.length; batchStart += PARALLEL_LIMIT) {
-        const batch = layer.slice(batchStart, batchStart + PARALLEL_LIMIT);
-
-        const batchResults = await Promise.all(
-          batch.map((item) => processOneSegment(
-            item, config, deps, crossLinks, direction,
-            maxDepth, relationTypes, includeTests, minConfidence,
-            openedRepoIds,
-          )),
-        );
-
-        // Collect results and enqueue next-layer items (single-threaded, no race)
-        for (const result of batchResults) {
+      // Collect results and enqueue next-layer items
+      for (const groupResults of batchResults) {
+        for (const result of groupResults) {
           if (result.skipped) {
             skippedRepos.push(result.repoPath);
             continue;
@@ -873,7 +951,6 @@ export async function runGroupTrace(
             const nextEndpoint = isTopicHop
               ? (direction === 'downstream' ? hop.from : hop.to)
               : (direction === 'downstream' ? hop.to : hop.from);
-            // Same dedup strategy as Phase 1: topic hops dedup by repo only
             const key = isTopicHop
               ? `topic::${nextEndpoint.repo}`
               : `${nextEndpoint.repo}::${nextEndpoint.symbolName}`;
@@ -890,8 +967,10 @@ export async function runGroupTrace(
         }
       }
     }
+  }
+
   } finally {
-    // Close lbug connections opened by this trace
+    // Close all lbug connections opened during this trace
     for (const rid of openedRepoIds) {
       await closeLbug(rid).catch(() => {});
     }
