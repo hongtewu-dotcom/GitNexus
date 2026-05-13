@@ -242,11 +242,90 @@ function scoreCandidate(c: SymbolCandidate, classVariants?: string[], target?: s
   return s;
 }
 
+/**
+ * Given a Class/Interface/Constructor node, drill down to a Method node in the
+ * same file that is a better BFS seed (because BFS follows CALLS edges which
+ * only exist between Method nodes, not from Class nodes).
+ *
+ * For Thrift entry points (e.g. SecondCheckThriftServer), prefers the public
+ * method whose name matches common RPC handler patterns. Falls back to any
+ * Method in the file if no well-known handler is found.
+ *
+ * Returns the original node unchanged if it is already a Method, or if no
+ * Method nodes exist in the same file.
+ */
+async function drillDownToMethod(
+  repoId: string,
+  node: { id: string; name: string; type: string; filePath: string },
+): Promise<{ id: string; name: string; type: string; filePath: string }> {
+  // Already a Method — nothing to do
+  if (node.id.startsWith('Method:')) return node;
+  if (!node.filePath) return node;
+
+  const methods = await executeParameterized(
+    repoId,
+    `MATCH (m:Method) WHERE m.filePath = $fp
+     RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
+    { fp: node.filePath },
+  );
+  if (methods.length === 0) return node;
+
+  // Well-known handler method names (covers Thrift RPC + MQ consumers)
+  const handlerNames = new Set([
+    'handleMessage', 'onRecvMessage', 'consume', 'onMessage',
+    'process', 'execute', 'run',
+    // Thrift RPC entry methods often share the service class name
+    // but we don't know the exact name here — fall back to scoring
+  ]);
+
+  // Prefer handler methods, then score by implementation quality
+  let bestMethod: Record<string, unknown> | null = null;
+  let bestScore = -Infinity;
+
+  for (const m of methods) {
+    const mName = (m.name ?? m[1]) as string;
+    const mId = (m.id ?? m[0]) as string;
+    let score = 0;
+
+    if (handlerNames.has(mName)) score += 100;
+    // Prefer methods that contain the class name (e.g. secondCheck in SecondCheckThriftServer)
+    if (mId.includes('Impl') || mId.includes('Server')) score += 20;
+    // Penalize getters/setters/toString/hashCode
+    if (/^(get|set|is|toString|hashCode|equals)/.test(mName)) score -= 50;
+    // Penalize constructors leaked as Method nodes
+    if (mName === '<init>' || mName === '<clinit>') score -= 100;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMethod = m;
+    }
+  }
+
+  if (!bestMethod) bestMethod = methods[0];
+
+  const result = {
+    id: (bestMethod.id ?? bestMethod[0]) as string,
+    name: (bestMethod.name ?? bestMethod[1]) as string,
+    type: (bestMethod.type ?? bestMethod[2]) as string,
+    filePath: (bestMethod.filePath ?? bestMethod[3]) as string,
+  };
+
+  logger.info(
+    `[trace] drillDownToMethod: "${node.id}" → "${result.id}" (${methods.length} methods in file)`,
+  );
+
+  return result;
+}
+
 /** Resolve a symbol name/file to its lbug node id.
  *
  * When multiple candidates match by name, uses the same scoring logic as
  * resolveByName to prefer implementation classes over client interfaces,
  * Method nodes over Class nodes, and -server/ paths over -client/ paths.
+ *
+ * If the resolved symbol is a Class/Interface/Constructor node, automatically
+ * drills down to a Method node in the same file so that BFS (which requires
+ * CALLS edges) can proceed.
  */
 async function resolveEntrySymbol(
   repoId: string,
@@ -262,12 +341,13 @@ async function resolveEntrySymbol(
   );
   if (exactRows.length > 0) {
     const r = exactRows[0];
-    return {
+    const matched = {
       id: r.id ?? r[0],
       name: r.name ?? r[1],
       type: r.type ?? r[2],
       filePath: r.filePath ?? r[3],
     };
+    return drillDownToMethod(repoId, matched);
   }
 
   // Fetch ALL candidates matching by name (no LIMIT 1)
@@ -287,7 +367,7 @@ async function resolveEntrySymbol(
   }));
 
   // Single candidate — no scoring needed
-  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 1) return drillDownToMethod(repoId, candidates[0]);
 
   // Score and pick the best candidate (pass target for semantic relevance)
   candidates.sort((a, b) => scoreCandidate(b, undefined, target) - scoreCandidate(a, undefined, target));
@@ -298,7 +378,7 @@ async function resolveEntrySymbol(
     `selected "${best.id}" (score=${scoreCandidate(best, undefined, target)}) over ${candidates.slice(1, 4).map(c => `"${c.id}"(${scoreCandidate(c, undefined, target)})`).join(', ')}${candidates.length > 4 ? ` ... and ${candidates.length - 4} more` : ''}`,
   );
 
-  return best;
+  return drillDownToMethod(repoId, best);
 }
 
 /**

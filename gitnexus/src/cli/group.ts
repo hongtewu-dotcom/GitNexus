@@ -388,7 +388,8 @@ export function registerGroupCommands(program: Command): void {
     .option('--relation-types <types>', 'Comma-separated relation types (default: CALLS)', 'CALLS')
     .option('--min-confidence <n>', 'Minimum edge confidence (0–1)', '0')
     .option('--include-tests', 'Include test files in traversal', false)
-    .option('--json', 'JSON output')
+    .option('--json', 'JSON output (summary by default — no nodes, crossHops deduplicated by contractId)')
+    .option('--verbose', 'Full output with all nodes and raw crossHops (use with --json for complete data)')
     .action(async (name: string, opts: Record<string, string | boolean | undefined>) => {
       const { LocalBackend } = await import('../mcp/local/local-backend.js');
 
@@ -443,37 +444,155 @@ export function registerGroupCommands(program: Command): void {
           truncated: boolean;
         };
 
+        const verbose = Boolean(opts.verbose);
+
         if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
+          if (verbose) {
+            // --verbose: full output with all nodes and raw crossHops
+            console.log(JSON.stringify(result, null, 2));
+          } else {
+            // Default summary: no nodes, crossHops deduplicated by contractId
+            const summary = buildTraceSummary(result);
+            console.log(JSON.stringify(summary, null, 2));
+          }
         } else {
-          console.log(
-            `Trace: ${result.entryTarget} (${result.entryRepo}) [${result.direction}]\n`,
-          );
-          for (const seg of result.segments) {
-            console.log(`  Repo: ${seg.repoPath} (${seg.repo})`);
-            console.log(`    Entry: ${seg.entrySymbolUid}`);
-            console.log(`    Nodes: ${seg.nodes.length}`);
-            if (seg.crossHops.length > 0) {
-              console.log(`    Cross-hops:`);
-              for (const hop of seg.crossHops) {
-                console.log(
-                  `      ${hop.from.repo} -> ${hop.to.repo}  [${hop.contractType}] ${hop.contractId}  (conf=${hop.linkConfidence})`,
-                );
+          if (verbose) {
+            // Text verbose: show node counts
+            console.log(
+              `Trace: ${result.entryTarget} (${result.entryRepo}) [${result.direction}]\n`,
+            );
+            for (const seg of result.segments) {
+              console.log(`  Repo: ${seg.repoPath} (${seg.repo})`);
+              console.log(`    Entry: ${seg.entrySymbolUid}`);
+              console.log(`    Nodes: ${seg.nodes.length}`);
+              if (seg.crossHops.length > 0) {
+                console.log(`    Cross-hops:`);
+                for (const hop of seg.crossHops) {
+                  console.log(
+                    `      ${hop.from.repo} -> ${hop.to.repo}  [${hop.contractType}] ${hop.contractId}  (conf=${hop.linkConfidence})`,
+                  );
+                }
               }
             }
+            if (result.skippedRepos.length > 0) {
+              console.log(`\n  Skipped repos: ${result.skippedRepos.join(', ')}`);
+            }
+            if (result.truncated) {
+              console.log(`\n  (truncated — maxCrossDepth reached)`);
+            }
+            console.log(
+              `\n  Total: ${result.segments.length} repo segments, ${result.segments.reduce((s, seg) => s + seg.nodes.length, 0)} nodes`,
+            );
+          } else {
+            // Text summary
+            const summary = buildTraceSummary(result);
+            console.log(
+              `Trace: ${summary.entryTarget} (${summary.entryRepo}) [${summary.direction}]\n`,
+            );
+            console.log(`  Cross-hops (${summary.crossHops.length} unique by contractId):`);
+            for (const hop of summary.crossHops) {
+              console.log(
+                `    ${hop.from.repo} -> ${hop.to.repo}  [${hop.contractType}] ${hop.contractId}  (${hop.from.symbolName} -> ${hop.to.symbolName})`,
+              );
+            }
+            console.log(`\n  Stats: ${summary.stats.totalRepos} repos, ${summary.stats.totalSegments} segments, ${summary.crossHops.length} cross-hops (${summary.stats.rawCrossHops} raw)`);
+            console.log(`  (use --verbose for full output with ${summary.stats.totalNodes} nodes)`);
           }
-          if (result.skippedRepos.length > 0) {
-            console.log(`\n  Skipped repos: ${result.skippedRepos.join(', ')}`);
-          }
-          if (result.truncated) {
-            console.log(`\n  (truncated — maxCrossDepth reached)`);
-          }
-          console.log(
-            `\n  Total: ${result.segments.length} repo segments, ${result.segments.reduce((s, seg) => s + seg.nodes.length, 0)} nodes`,
-          );
         }
       } finally {
         await backend.dispose().catch(() => {});
       }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Summary builder — deduplicates crossHops by contractId level and strips nodes
+// ---------------------------------------------------------------------------
+
+interface TraceSummaryHop {
+  contractId: string;
+  contractType: string;
+  from: { repo: string; symbolName: string };
+  to: { repo: string; symbolName: string };
+}
+
+interface TraceSummary {
+  group: string;
+  entryRepo: string;
+  entryTarget: string;
+  direction: string;
+  crossHops: TraceSummaryHop[];
+  stats: {
+    totalRepos: number;
+    totalSegments: number;
+    totalNodes: number;
+    rawCrossHops: number;
+    dedupCrossHops: number;
+  };
+}
+
+function buildTraceSummary(result: {
+  group?: string;
+  entryRepo: string;
+  entryTarget: string;
+  direction: string;
+  segments: Array<{
+    repo: string;
+    repoPath: string;
+    entrySymbolUid: string;
+    nodes: unknown[];
+    crossHops: Array<{
+      from: { repo: string; symbolUid?: string; symbolName?: string };
+      to: { repo: string; symbolUid?: string; symbolName?: string };
+      contractType: string;
+      contractId: string;
+      linkConfidence: number;
+    }>;
+  }>;
+  skippedRepos: string[];
+  truncated: boolean;
+}): TraceSummary {
+  // Deduplicate crossHops by (from.repo + to.repo + contractId + contractType)
+  // Keep first occurrence's symbolName as representative
+  const seen = new Set<string>();
+  const dedupHops: TraceSummaryHop[] = [];
+  let rawCount = 0;
+
+  for (const seg of result.segments) {
+    for (const hop of seg.crossHops) {
+      rawCount++;
+      const key = `${hop.from.repo}\0${hop.to.repo}\0${hop.contractId}\0${hop.contractType}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        dedupHops.push({
+          contractId: hop.contractId,
+          contractType: hop.contractType,
+          from: { repo: hop.from.repo, symbolName: hop.from.symbolName ?? hop.from.symbolUid ?? '' },
+          to: { repo: hop.to.repo, symbolName: hop.to.symbolName ?? hop.to.symbolUid ?? '' },
+        });
+      }
+    }
+  }
+
+  // Collect unique repos from crossHops
+  const repoSet = new Set<string>();
+  for (const hop of dedupHops) {
+    repoSet.add(hop.from.repo);
+    repoSet.add(hop.to.repo);
+  }
+
+  return {
+    group: result.group ?? '',
+    entryRepo: result.entryRepo,
+    entryTarget: result.entryTarget,
+    direction: result.direction,
+    crossHops: dedupHops,
+    stats: {
+      totalRepos: repoSet.size,
+      totalSegments: result.segments.length,
+      totalNodes: result.segments.reduce((sum, seg) => sum + seg.nodes.length, 0),
+      rawCrossHops: rawCount,
+      dedupCrossHops: dedupHops.length,
+    },
+  };
 }
