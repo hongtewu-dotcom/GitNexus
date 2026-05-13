@@ -10,6 +10,7 @@ import type { ExtractedContract, RepoHandle } from '../types.js';
  * MDP projects configure Mafka consumers/producers in:
  *   - profiles/{env}/mafka.properties
  *   - mafka.properties (root or app module)
+ *   - application.properties (some projects inline mafka config here)
  *
  * Property patterns:
  *   mdp.mafka.consumers[N].topicName = <topic>
@@ -73,7 +74,9 @@ export class MafkaPropertiesExtractor implements ContractExtractor {
     repoPath: string,
     _repo: RepoHandle,
   ): Promise<ExtractedContract[]> {
-    const files = await glob('**/mafka.properties', {
+    // Scan mafka.properties AND application.properties (some projects inline
+    // mdp.mafka.* config in application.properties instead of a separate file)
+    const files = await glob('**/{mafka,application}.properties', {
       cwd: repoPath,
       nodir: true,
       ignore: ['**/node_modules/**', '**/.git/**', '**/target/**', '**/build/**'],
