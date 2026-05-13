@@ -385,11 +385,21 @@ async function fuzzyResolveConsumerClass(
           OR c.filePath CONTAINS 'Mafka')
      AND NOT c.filePath CONTAINS 'test/'
      AND NOT c.filePath CONTAINS 'Test'
+     AND NOT c.filePath CONTAINS '/model/'
+     AND NOT c.filePath CONTAINS '/dto/'
+     AND NOT c.filePath CONTAINS '/entity/'
+     AND NOT c.filePath CONTAINS '/vo/'
+     AND NOT c.filePath CONTAINS '/pojo/'
      RETURN c.id AS id, c.name AS name, c.filePath AS filePath`,
     {},
   );
 
   if (candidates.length === 0) return null;
+
+  // Class name suffixes/substrings that indicate non-consumer classes
+  const NON_CONSUMER_SUFFIXES = ['Model', 'Dto', 'DTO', 'VO', 'Entity', 'Request', 'Response', 'Result', 'Param', 'Config', 'Message'];
+  // Class name substrings that indicate producers (not consumers)
+  const PRODUCER_INDICATORS = ['Producer', 'Sender', 'Publisher'];
 
   // Score each candidate by token overlap with core tokens
   let bestScore = 0;
@@ -397,6 +407,11 @@ async function fuzzyResolveConsumerClass(
 
   for (const row of candidates) {
     const candidateName = (row.name ?? row[1]) as string;
+
+    // Skip classes whose name ends with a non-consumer suffix or contains producer indicators
+    if (NON_CONSUMER_SUFFIXES.some((suffix) => candidateName.endsWith(suffix))) continue;
+    if (PRODUCER_INDICATORS.some((ind) => candidateName.includes(ind))) continue;
+
     const candidateTokens = tokenizeSymbolName(candidateName)
       .filter((t) => !CONSUMER_NOISE_TOKENS.has(t));
 
@@ -409,23 +424,54 @@ async function fuzzyResolveConsumerClass(
     // Score = matched / max(inputCore, candidateCore) to normalize
     const score = matchCount / Math.max(coreTokens.length, candidateTokens.length || 1);
 
-    if (score > bestScore) {
+    const nodeId = (row.id ?? row[0]) as string;
+    const isClass = nodeId.startsWith('Class:');
+
+    // Prefer higher score; on tie, prefer Impl class over Interface/abstract
+    const isImpl = isClass && (candidateName.endsWith('Impl') || candidateName.includes('Impl'));
+    const bestIsInterface = bestCandidate?.type === 'Interface' || (bestCandidate && !bestCandidate.name.includes('Impl'));
+    if (score > bestScore || (score === bestScore && isImpl && bestIsInterface)) {
       bestScore = score;
-      const nodeId = (row.id ?? row[0]) as string;
       bestCandidate = {
         id: nodeId,
         name: candidateName,
-        type: nodeId.startsWith('Class:') ? 'Class' : 'Interface',
+        type: isClass ? 'Class' : 'Interface',
         filePath: (row.filePath ?? row[2]) as string,
       };
     }
   }
 
-  // Require at least 40% token overlap to avoid false positives
+  // Require at least 40% token overlap to avoid false positives.
+  // Exception: if there's only ONE viable consumer class in the repo,
+  // use it as fallback (high confidence when the repo has a single consumer).
   if (!bestCandidate || bestScore < 0.4) {
+    // Count viable candidates (those that passed suffix + producer filter)
+    const viableCandidates = candidates.filter((row) => {
+      const name = (row.name ?? row[1]) as string;
+      if (NON_CONSUMER_SUFFIXES.some((suffix) => name.endsWith(suffix))) return false;
+      if (PRODUCER_INDICATORS.some((ind) => name.includes(ind))) return false;
+      return true;
+    });
+    if (viableCandidates.length === 1) {
+      const sole = viableCandidates[0];
+      const soleId = (sole.id ?? sole[0]) as string;
+      const soleName = (sole.name ?? sole[1]) as string;
+      const soleCandidate = {
+        id: soleId,
+        name: soleName,
+        type: soleId.startsWith('Class:') ? 'Class' : 'Interface',
+        filePath: (sole.filePath ?? sole[2]) as string,
+      };
+      logger.info(
+        `[trace] fuzzyResolveConsumerClass: "${symbolName}" → "${soleName}" ` +
+        `(sole-consumer fallback, coreTokens=[${coreTokens.join(',')}])`,
+      );
+      return findHandlerMethodInFile(soleCandidate);
+    }
+
     logger.info(
       `[trace] fuzzyResolveConsumerClass: no match for "${symbolName}" (best score=${bestScore.toFixed(2)}, ` +
-      `coreTokens=[${coreTokens.join(',')}], candidates=${candidates.length})`,
+      `coreTokens=[${coreTokens.join(',')}], viable=${viableCandidates.length}, candidates=${candidates.length})`,
     );
     return null;
   }
