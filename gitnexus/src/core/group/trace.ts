@@ -565,6 +565,85 @@ async function fuzzyResolveConsumerClass(
   return findHandlerMethodInFile(bestCandidate);
 }
 
+/**
+ * Check if a file path belongs to a client/IDL/thrift-common module (not a server implementation).
+ * These modules contain interface definitions that are dead-ends for BFS (no CALLS edges).
+ */
+function isClientModulePath(filePath: string): boolean {
+  if (!filePath) return false;
+  const fp = filePath.toLowerCase();
+  // Standard client module patterns
+  if (fp.includes('-client/') || fp.includes('-client-') || fp.includes('_client/') ||
+    fp.includes('-thrift-common/') || fp.includes('-thrift-inner/') ||
+    fp.includes('/idl/') || fp.endsWith('.thrift')) return true;
+  // API interface modules (e.g. flight-biz-international-api/)
+  if (/-api\//.test(fp)) return true;
+  // Client modules with version suffix (e.g. flightTracker-client0.8.0/)
+  if (/[_-]client\d/.test(fp)) return true;
+  return false;
+}
+
+/**
+ * Fallback resolve: when resolveByName picks a client-module interface definition
+ * (dead-end for BFS), search for the server-side implementation class in the same repo.
+ *
+ * Strategy:
+ *   1. Extract the short method name from symbolName (e.g. "checkTransit" from
+ *      "TTransitSecondCheckService.checkTransit").
+ *   2. Search for Method nodes with that name in server/impl directories
+ *      (excluding client/test/thrift-common paths).
+ *   3. Score candidates: prefer -server/ paths, Impl classes, ThriftServiceImpl patterns.
+ *   4. Return the best candidate, or null if no server-side implementation found.
+ */
+async function resolveServerImpl(
+  repoId: string,
+  symbolName: string,
+): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
+  const lastDot = symbolName.lastIndexOf('.');
+  const shortName = lastDot >= 0 ? symbolName.slice(lastDot + 1) : symbolName;
+  if (!shortName) return null;
+
+  // Search for all Method nodes with the short name, excluding client/test/thrift paths
+  const rows = await executeParameterized(
+    repoId,
+    `MATCH (n) WHERE n.name = $name
+     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
+    { name: shortName },
+  );
+  if (rows.length === 0) return null;
+
+  // Filter out client-module and test candidates
+  const serverCandidates = rows
+    .map((r: Record<string, unknown>) => ({
+      id: (r.id ?? r[0]) as string,
+      name: (r.name ?? r[1]) as string,
+      type: (r.type ?? r[2]) as string,
+      filePath: (r.filePath ?? r[3]) as string,
+    }))
+    .filter((c) => !isClientModulePath(c.filePath) && !isTestFilePath(c.filePath));
+
+  if (serverCandidates.length === 0) return null;
+
+  // Score: prefer -server/ paths, Impl classes, Method nodes
+  const scored = serverCandidates.map((c) => {
+    let score = 0;
+    if (c.filePath.includes('-server/') || c.filePath.includes('-service/') ||
+        c.filePath.includes('_server/') || c.filePath.includes('_service/')) score += 50;
+    if (c.id.startsWith('Method:')) score += 10;
+    if (c.id.toLowerCase().includes('impl')) score += 20;
+    if (c.id.toLowerCase().includes('thriftserver') || c.id.toLowerCase().includes('thriftserviceimpl')) score += 30;
+    return { ...c, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  logger.info(
+    `[trace] resolveServerImpl fallback: "${symbolName}" → "${best.id}" ` +
+    `(score=${best.score}, ${scored.length} server candidates from ${rows.length} total)`,
+  );
+  return best;
+}
+
 /** Resolve a symbol by name in a repo's lbug (for cross-repo entry).
  *
  * symbolName comes from contracts.json `to.symbolRef.name`, typically in
@@ -1022,7 +1101,7 @@ async function processOneSegment(
         `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName for "${item.symbolName}"`,
       );
     } else {
-      const targetSym = await resolveByName(repoHandle.id, item.symbolName);
+      let targetSym = await resolveByName(repoHandle.id, item.symbolName);
       if (!targetSym) {
         logger.warn(
           `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
@@ -1042,6 +1121,36 @@ async function processOneSegment(
       );
       nodes = bfsResult.nodes;
       visitedFilePaths = bfsResult.visitedFilePaths;
+
+      // Fallback: if BFS returned empty nodes and the resolved symbol is in a
+      // client/IDL module (interface definition, no CALLS edges), try to find
+      // the server-side implementation and re-run BFS from there.
+      if (nodes.length === 0 && isClientModulePath(targetSym.filePath)) {
+        logger.info(
+          `[trace] empty BFS from client-module symbol "${targetSym.id}" in "${item.repoPath}", ` +
+          `attempting server-impl fallback for "${item.symbolName}"`,
+        );
+        const serverSym = await resolveServerImpl(repoHandle.id, item.symbolName);
+        if (serverSym) {
+          entrySymbolUid = serverSym.id;
+          const retryBfs = await intraRepoBFS(
+            repoHandle.id,
+            [serverSym.id],
+            serverSym.filePath ? [serverSym.filePath] : [],
+            direction,
+            { maxDepth, relationTypes, includeTests, minConfidence },
+          );
+          nodes = retryBfs.nodes;
+          visitedFilePaths = retryBfs.visitedFilePaths;
+          logger.info(
+            `[trace] server-impl fallback BFS: ${nodes.length} nodes from "${serverSym.id}"`,
+          );
+        } else {
+          logger.info(
+            `[trace] no server-impl found for "${item.symbolName}" in "${item.repoPath}", keeping empty segment`,
+          );
+        }
+      }
     }
 
     // Find cross-repo hops via pre-built index

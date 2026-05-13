@@ -37,14 +37,25 @@ interface TraceCrossHop {
   targetRepoPath: string;
 }
 
+// Summary format crossHop (from `--json` without `--verbose`)
+interface SummaryCrossHop {
+  contractId: string;
+  contractType: string;
+  from: { repo: string; symbolName: string };
+  to: { repo: string; symbolName: string };
+}
+
 interface TraceResult {
-  group: string;
-  entryRepo: string;
-  entryTarget: string;
-  direction: string;
-  segments: TraceSegment[];
-  skippedRepos: string[];
-  truncated: boolean;
+  group?: string;
+  entryRepo?: string;
+  entryTarget?: string;
+  direction?: string;
+  segments?: TraceSegment[];
+  skippedRepos?: string[];
+  truncated?: boolean;
+  // Summary format fields
+  crossHops?: SummaryCrossHop[];
+  stats?: { totalRepos: number; dedupCrossHops: number };
 }
 
 interface StandardService {
@@ -71,6 +82,7 @@ interface StandardMqCall {
   direction: string;
   description: string;
   noCrossRepo?: boolean;
+  external?: boolean;
 }
 
 interface StandardReference {
@@ -187,14 +199,29 @@ function compareCoverage(trace: TraceResult, ref: StandardReference): CoverageRe
   const traceTopics = new Set<string>();
   const traceAllText = JSON.stringify(trace);
 
-  for (const seg of trace.segments) {
-    traceRepos.add(seg.repoPath);
-    for (const hop of seg.crossHops) {
+  if (trace.segments && Array.isArray(trace.segments)) {
+    // Verbose format: segments array
+    for (const seg of trace.segments) {
+      traceRepos.add(seg.repoPath);
+      for (const hop of seg.crossHops) {
+        traceContracts.add(hop.contractId);
+        if (hop.type === 'topic' || hop.contractId.startsWith('topic::')) {
+          traceTopics.add(hop.contractId);
+        }
+      }
+    }
+  } else if (trace.crossHops && Array.isArray(trace.crossHops)) {
+    // Summary format: top-level crossHops array
+    for (const hop of trace.crossHops as SummaryCrossHop[]) {
+      traceRepos.add(hop.from.repo);
+      traceRepos.add(hop.to.repo);
       traceContracts.add(hop.contractId);
-      if (hop.type === 'topic' || hop.contractId.startsWith('topic::')) {
+      if (hop.contractType === 'topic' || hop.contractId.startsWith('topic::')) {
         traceTopics.add(hop.contractId);
       }
     }
+  } else {
+    throw new Error('Trace file has neither segments (verbose) nor crossHops (summary) - unsupported format');
   }
 
   // --- Service-level ---
@@ -294,10 +321,10 @@ function compareCoverage(trace: TraceResult, ref: StandardReference): CoverageRe
   const coveredInterfaces = exactMatch + semanticMatch;
 
   // --- MQ Topic-level ---
-  const allTopics: { topic: string; description: string; noCrossRepo?: boolean }[] = [];
+  const allTopics: { topic: string; description: string; noCrossRepo?: boolean; external?: boolean }[] = [];
   for (const svc of Object.values(ref.services)) {
     for (const mq of svc.interfaces.outbound_mq) {
-      allTopics.push({ topic: mq.topic, description: mq.description, noCrossRepo: mq.noCrossRepo });
+      allTopics.push({ topic: mq.topic, description: mq.description, noCrossRepo: mq.noCrossRepo, external: mq.external });
     }
   }
 
@@ -305,9 +332,12 @@ function compareCoverage(trace: TraceResult, ref: StandardReference): CoverageRe
   const coveredTopicsList: string[] = [];
   const missingTopicsList: { topic: string; description: string }[] = [];
 
-  for (const { topic, description, noCrossRepo } of allTopics) {
+  let externalTopicSkipped = 0;
+  for (const { topic, description, noCrossRepo, external } of allTopics) {
     // Skip topics that can't produce crossLinks (self-consume, single-direction, etc.)
     if (noCrossRepo) { noCrossRepoTopicSkipped++; continue; }
+    // Skip external topics (consumer/producer outside our 83-repo group)
+    if (external) { externalTopicSkipped++; continue; }
 
     const topicContract = `topic::${topic}`;
     if (traceContracts.has(topicContract) || traceAllText.includes(topic)) {
@@ -347,16 +377,16 @@ function compareCoverage(trace: TraceResult, ref: StandardReference): CoverageRe
       missing: missingInterfaces,
     },
     mqCoverage: {
-      total: allTopics.length - noCrossRepoTopicSkipped,
+      total: allTopics.length - noCrossRepoTopicSkipped - externalTopicSkipped,
       covered: coveredTopicsList.length,
-      rate: `${Math.round(coveredTopicsList.length * 100 / Math.max(1, allTopics.length - noCrossRepoTopicSkipped))}%`,
+      rate: `${Math.round(coveredTopicsList.length * 100 / Math.max(1, allTopics.length - noCrossRepoTopicSkipped - externalTopicSkipped))}%`,
       missing: missingTopicsList,
     },
     effectiveCoverage: {
       description: '排除外部服务/无法追踪的接口后的有效覆盖率',
       serviceRate: `${Math.round(coveredServices.length * 100 / standardRepos.size)}%`,
       interfaceRate: `${Math.round(effectiveCovered * 100 / effectiveTotal)}%`,
-      mqRate: `${Math.round(coveredTopicsList.length * 100 / Math.max(1, allTopics.length - noCrossRepoTopicSkipped))}%`,
+      mqRate: `${Math.round(coveredTopicsList.length * 100 / Math.max(1, allTopics.length - noCrossRepoTopicSkipped - externalTopicSkipped))}%`,
     },
   };
 }

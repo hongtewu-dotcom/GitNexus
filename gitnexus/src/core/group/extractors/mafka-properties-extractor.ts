@@ -34,6 +34,49 @@ function capitalizeFirst(s: string): string {
   return s[0].toUpperCase() + s.slice(1);
 }
 
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Resolve the actual Java class name from a Spring bean ID by scanning source
+ * files for @Component("beanId") / @Service("beanId") / @Named("beanId").
+ *
+ * This handles cases where the bean name differs from the class name, e.g.:
+ *   - snake_case: @Component("flight_coupon_change_listener") class CouponIssueConsumer
+ *   - arbitrary:  @Service("businessMafkaListener") class MafkaConsumerListener
+ */
+async function resolveClassNameFromBeanId(
+  repoPath: string,
+  beanId: string,
+): Promise<string | null> {
+  // Only scan likely consumer/listener directories for performance
+  const javaFiles = await glob('**/src/main/java/**/*.java', {
+    cwd: repoPath,
+    nodir: true,
+    ignore: ['**/node_modules/**', '**/.git/**', '**/target/**', '**/build/**', '**/test/**'],
+  });
+
+  const annotationRe = new RegExp(
+    `@(?:Component|Service|Named)\\s*\\(\\s*(?:value\\s*=\\s*)?"${escapeRegex(beanId)}"\\s*\\)`,
+  );
+  const classRe = /(?:public\s+)?class\s+(\w+)/;
+
+  for (const rel of javaFiles) {
+    let content: string;
+    try {
+      content = fs.readFileSync(path.join(repoPath, rel), 'utf-8');
+    } catch {
+      continue;
+    }
+    if (annotationRe.test(content)) {
+      const m = classRe.exec(content);
+      if (m) return m[1];
+    }
+  }
+  return null;
+}
+
 function makeContract(
   topicName: string,
   role: 'provider' | 'consumer',
@@ -135,11 +178,14 @@ export class MafkaPropertiesExtractor implements ContractExtractor {
         if (seen.has(dedupeKey)) continue;
         seen.add(dedupeKey);
 
-        // Use listenerId (PascalCase) as symbolName when available, enabling
-        // LadybugDB resolution. Fall back to synthetic format otherwise.
+        // Use listenerId to derive symbolName for LadybugDB resolution.
+        // First try to resolve the actual class name from @Component/@Service
+        // annotations (handles bean name ≠ class name cases), then fall back
+        // to capitalizeFirst(listenerId), then to synthetic format.
         let symbolName: string;
         if (entry.listenerId && entry.role === 'consumer') {
-          symbolName = capitalizeFirst(entry.listenerId);
+          const resolvedClass = await resolveClassNameFromBeanId(repoPath, entry.listenerId);
+          symbolName = resolvedClass ?? capitalizeFirst(entry.listenerId);
         } else if (entry.role === 'provider') {
           symbolName = `mafkaProducer(${entry.topicName})`;
         } else {
