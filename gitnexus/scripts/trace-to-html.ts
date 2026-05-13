@@ -30,7 +30,8 @@ interface TraceRepoSegment {
   nodes: { id: string; name: string; type: string; filePath: string; depth: number }[];
   crossHops: TraceCrossHop[];
 }
-interface TraceResult {
+// Verbose format: has segments[]
+interface VerboseTraceResult {
   group: string;
   entryRepo: string;
   entryTarget: string;
@@ -39,45 +40,96 @@ interface TraceResult {
   skippedRepos: string[];
   truncated: boolean;
 }
+// Summary format: top-level crossHops[] + stats, no segments
+interface SummaryTraceResult {
+  group: string;
+  entryRepo: string;
+  entryTarget: string;
+  direction: string;
+  crossHops: TraceCrossHop[];
+  stats: { totalRepos: number; totalSegments: number; totalNodes: number; rawCrossHops: number; dedupCrossHops: number };
+  skippedRepos: string[];
+  truncated: boolean;
+}
+type TraceResult = VerboseTraceResult | SummaryTraceResult;
+function isVerbose(t: TraceResult): t is VerboseTraceResult { return Array.isArray((t as any).segments); }
 
 const inputFile = process.argv[2];
 const outputFile = process.argv[3] || inputFile?.replace(/\.json$/, '.html') || 'trace.html';
 if (!inputFile) { console.error('Usage: npx tsx scripts/trace-to-html.ts <trace.json> [output.html]'); process.exit(1); }
 
 const trace: TraceResult = JSON.parse(fs.readFileSync(inputFile, 'utf-8'));
+const verbose = isVerbose(trace);
 
 // Step 1: Build service graph
 interface ServiceInfo { repoPath: string; totalMethods: number; segmentCount: number; }
 const serviceMap = new Map<string, ServiceInfo>();
-for (const seg of trace.segments) {
-  const e = serviceMap.get(seg.repoPath);
-  if (e) { e.totalMethods += seg.nodes.length; e.segmentCount += 1; }
-  else serviceMap.set(seg.repoPath, { repoPath: seg.repoPath, totalMethods: seg.nodes.length, segmentCount: 1 });
-}
 
 interface EdgeMethod { contractType: string; contractId: string; methodName: string; }
 interface AggregatedEdge { from: string; to: string; methods: EdgeMethod[]; contractTypes: Set<string>; }
 const edgeMap = new Map<string, AggregatedEdge>();
 
-for (const seg of trace.segments) {
-  for (const hop of seg.crossHops) {
-    const isTopic = hop.contractType === 'topic';
-    const fromRepo = seg.repoPath;
-    const toRepo = isTopic
-      ? (trace.direction === 'downstream' ? hop.from.repo : hop.to.repo)
-      : (trace.direction === 'downstream' ? hop.to.repo : hop.from.repo);
-    const rawContract = hop.contractId.replace(/^(thrift|topic|http|custom|grpc)::/, '');
-    const methodName = rawContract.includes('/') ? rawContract.split('/').pop()! : rawContract;
-    const key = fromRepo + '->' + toRepo;
-    const existing = edgeMap.get(key);
-    if (existing) {
-      if (!existing.methods.some(m => m.contractId === hop.contractId)) {
-        existing.methods.push({ contractType: hop.contractType, contractId: hop.contractId, methodName });
-      }
-      existing.contractTypes.add(hop.contractType);
-    } else {
-      edgeMap.set(key, { from: fromRepo, to: toRepo, methods: [{ contractType: hop.contractType, contractId: hop.contractId, methodName }], contractTypes: new Set([hop.contractType]) });
+function addEdge(fromRepo: string, toRepo: string, hop: TraceCrossHop) {
+  const rawContract = hop.contractId.replace(/^(thrift|topic|http|custom|grpc)::/, '');
+  const methodName = rawContract.includes('/') ? rawContract.split('/').pop()! : rawContract;
+  const key = fromRepo + '->' + toRepo;
+  const existing = edgeMap.get(key);
+  if (existing) {
+    if (!existing.methods.some(m => m.contractId === hop.contractId)) {
+      existing.methods.push({ contractType: hop.contractType, contractId: hop.contractId, methodName });
     }
+    existing.contractTypes.add(hop.contractType);
+  } else {
+    edgeMap.set(key, { from: fromRepo, to: toRepo, methods: [{ contractType: hop.contractType, contractId: hop.contractId, methodName }], contractTypes: new Set([hop.contractType]) });
+  }
+}
+
+if (verbose) {
+  // Verbose mode: build from segments (original logic)
+  for (const seg of trace.segments) {
+    const e = serviceMap.get(seg.repoPath);
+    if (e) { e.totalMethods += seg.nodes.length; e.segmentCount += 1; }
+    else serviceMap.set(seg.repoPath, { repoPath: seg.repoPath, totalMethods: seg.nodes.length, segmentCount: 1 });
+  }
+  for (const seg of trace.segments) {
+    for (const hop of seg.crossHops) {
+      const isTopic = hop.contractType === 'topic';
+      const fromRepo = seg.repoPath;
+      const toRepo = isTopic
+        ? (trace.direction === 'downstream' ? hop.from.repo : hop.to.repo)
+        : (trace.direction === 'downstream' ? hop.to.repo : hop.from.repo);
+      addEdge(fromRepo, toRepo, hop);
+    }
+  }
+} else {
+  // Summary mode: build from top-level crossHops
+  const hops = trace.crossHops;
+  // Collect all repo names from hop endpoints, count appearances as proxy for "methods"
+  const repoHits = new Map<string, number>();
+  function bumpRepo(repo: string) { repoHits.set(repo, (repoHits.get(repo) ?? 0) + 1); }
+  for (const hop of hops) {
+    const isTopic = hop.contractType === 'topic';
+    let fromRepo: string, toRepo: string;
+    if (isTopic) {
+      // topic: from.repo publishes, to.repo consumes — direction doesn't flip
+      fromRepo = hop.from.repo;
+      toRepo = hop.to.repo;
+    } else {
+      // thrift/http/grpc: from calls to
+      fromRepo = hop.from.repo;
+      toRepo = hop.to.repo;
+    }
+    bumpRepo(fromRepo);
+    bumpRepo(toRepo);
+    addEdge(fromRepo, toRepo, hop);
+  }
+  // Build serviceMap from repoHits
+  for (const [repo, hits] of repoHits) {
+    serviceMap.set(repo, { repoPath: repo, totalMethods: hits, segmentCount: 1 });
+  }
+  // Also register the entryRepo if not already present
+  if (!serviceMap.has(trace.entryRepo)) {
+    serviceMap.set(trace.entryRepo, { repoPath: trace.entryRepo, totalMethods: 0, segmentCount: 1 });
   }
 }
 
@@ -90,10 +142,19 @@ interface TreeNodeData {
   childCount?: number;
 }
 
-const entryRepo = trace.segments[0]?.repoPath ?? trace.entryRepo;
+const entryRepo = verbose ? (trace.segments[0]?.repoPath ?? trace.entryRepo) : trace.entryRepo;
+
+// Pre-compute outgoing edge weight for each repo (total downstream fan-out)
+const repoOutWeight = new Map<string, number>();
+for (const [, edge] of edgeMap) {
+  repoOutWeight.set(edge.from, (repoOutWeight.get(edge.from) ?? 0) + edge.methods.length);
+}
+
+// Track where each node is fully expanded: repo -> { parentNode, childIndex, incomingEdgeCount }
+const expandedAt = new Map<string, { parent: TreeNodeData; idx: number; incomingWeight: number }>();
 const globalVisited = new Set<string>();
 
-function buildTree(repo: string, ancestors: Set<string>): TreeNodeData {
+function buildTree(repo: string, ancestors: Set<string>, incomingWeight: number): TreeNodeData {
   const svc = serviceMap.get(repo);
   const node: TreeNodeData = { name: repo, domain: repo.split('/')[0], methods: svc?.totalMethods ?? 0, children: [] };
   globalVisited.add(repo);
@@ -112,19 +173,34 @@ function buildTree(repo: string, ancestors: Set<string>): TreeNodeData {
     const edgeInfo = { edgeMethods: edge.methods.map(m => ({ type: m.contractType, name: m.methodName })), edgeType: primaryType, edgeCount: edge.methods.length };
 
     if (ancestors.has(edge.to)) {
+      // True cycle — always ref
       node.children.push({ name: edge.to, domain: edge.to.split('/')[0], methods: 0, children: [], ...edgeInfo, refType: 'cycle' });
     } else if (globalVisited.has(edge.to)) {
-      node.children.push({ name: edge.to, domain: edge.to.split('/')[0], methods: serviceMap.get(edge.to)?.totalMethods ?? 0, children: [], ...edgeInfo, refType: 'ref' });
+      // Already expanded elsewhere — check if current path deserves the full subtree
+      const prev = expandedAt.get(edge.to);
+      if (prev && edge.methods.length > prev.incomingWeight) {
+        // Current path has higher edge weight: steal the subtree, demote previous to ref
+        const fullChild = prev.parent.children[prev.idx];
+        // Demote previous location to ref
+        prev.parent.children[prev.idx] = { name: edge.to, domain: edge.to.split('/')[0], methods: serviceMap.get(edge.to)?.totalMethods ?? 0, children: [], edgeMethods: fullChild.edgeMethods, edgeType: fullChild.edgeType, edgeCount: fullChild.edgeCount, refType: 'ref' };
+        // Place full subtree here
+        Object.assign(fullChild, edgeInfo);
+        node.children.push(fullChild);
+        expandedAt.set(edge.to, { parent: node, idx: node.children.length - 1, incomingWeight: edge.methods.length });
+      } else {
+        node.children.push({ name: edge.to, domain: edge.to.split('/')[0], methods: serviceMap.get(edge.to)?.totalMethods ?? 0, children: [], ...edgeInfo, refType: 'ref' });
+      }
     } else {
-      const child = buildTree(edge.to, newAncestors);
+      const child = buildTree(edge.to, newAncestors, edge.methods.length);
       Object.assign(child, edgeInfo);
       node.children.push(child);
+      expandedAt.set(edge.to, { parent: node, idx: node.children.length - 1, incomingWeight: edge.methods.length });
     }
   }
   return node;
 }
 
-const treeData = buildTree(entryRepo, new Set());
+const treeData = buildTree(entryRepo, new Set(), 0);
 
 function calcChildCount(n: TreeNodeData): number {
   if (n.refType) return 0;

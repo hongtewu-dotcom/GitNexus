@@ -222,7 +222,6 @@ export async function buildThriftContext(repoPath: string): Promise<ThriftContex
     // (the canonical ingestion ignore filter, like include-extractor.ts now uses).
     // New entries to DEFAULT_IGNORE_LIST in src/config/ignore-service.ts (e.g.
     // third_party, 3rdparty added in commit a9936a9b) silently do not apply here.
-    ignore: ['**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**'],
     ignore: [
       '**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**',
       '**/target/**',
@@ -304,7 +303,6 @@ export class ThriftExtractor implements ContractExtractor {
       // (the canonical ingestion ignore filter, like include-extractor.ts now uses).
       // New entries to DEFAULT_IGNORE_LIST in src/config/ignore-service.ts (e.g.
       // third_party, 3rdparty added in commit a9936a9b) silently do not apply here.
-      ignore: ['**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**'],
       ignore: [
         '**/node_modules/**', '**/.git/**', '**/vendor/**', '**/dist/**', '**/build/**',
         '**/src/test/**', '**/src/it/**', '**/test/**', '**/tests/**',

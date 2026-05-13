@@ -97,13 +97,35 @@ echo "       Direction: $DIRECTION"
 echo "       Max depth: $MAX_DEPTH, Cross depth: $MAX_CROSS_DEPTH"
 echo ""
 
+RAW_FILE="${JSON_FILE}.raw"
 gitnexus group trace "$GROUP" \
   --target "$TARGET" \
   --repo "$REPO" \
   --direction "$DIRECTION" \
   --max-depth "$MAX_DEPTH" \
   --max-cross-depth "$MAX_CROSS_DEPTH" \
-  --json > "$JSON_FILE"
+  --json > "$RAW_FILE"
+
+# Strip pino log lines (JSON objects with "level" key) from stdout, keep only trace result
+# Trace JSON is a multi-line object starting with a lone '{' line (after log lines)
+python3 -c "
+import sys, json
+lines = open('$RAW_FILE').readlines()
+# Find the first line that is just '{' (start of trace JSON object)
+start = None
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped == '{':
+        # Verify next line has 'group' key
+        if i + 1 < len(lines) and '\"group\"' in lines[i + 1]:
+            start = i
+            break
+if start is None:
+    sys.exit('Could not find trace JSON in output')
+with open('$JSON_FILE', 'w') as f:
+    f.writelines(lines[start:])
+" || { echo "❌ Failed to extract trace JSON from output"; exit 1; }
+rm -f "$RAW_FILE"
 
 # 验证输出
 if [[ ! -s "$JSON_FILE" ]]; then
@@ -111,8 +133,19 @@ if [[ ! -s "$JSON_FILE" ]]; then
   exit 1
 fi
 
-SEGMENTS=$(python3 -c "import json;d=json.load(open('$JSON_FILE'));print(len(d.get('segments',[])))" 2>/dev/null || echo "?")
-echo "   ✅ Trace complete: $JSON_FILE ($SEGMENTS segments)"
+TRACE_INFO=$(python3 -c "
+import json
+d=json.load(open('$JSON_FILE'))
+segs=d.get('segments')
+if segs is not None:
+    print(f'{len(segs)} segments (verbose)')
+else:
+    hops=d.get('crossHops',[])
+    stats=d.get('stats',{})
+    repos=stats.get('totalRepos','?')
+    print(f'{len(hops)} crossHops, {repos} repos (summary)')
+" 2>/dev/null || echo "?")
+echo "   ✅ Trace complete: $JSON_FILE ($TRACE_INFO)"
 echo ""
 
 # ─── Step 2: Convert to HTML ─────────────────────────────────────────────────

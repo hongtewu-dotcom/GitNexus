@@ -115,7 +115,7 @@ function deduplicateByKey(contracts: StoredContract[]): StoredContract[] {
   const best = new Map<string, StoredContract>();
 
   for (const c of contracts) {
-    const key = `${c.contractId}\x00${c.role}\x00${c.repo}`;
+    const key = `${c.contractId}\x00${c.role}\x00${c.repo}\x00${c.symbolRef.filePath}`;
     const existing = best.get(key);
     if (!existing || c.confidence > existing.confidence) {
       best.set(key, c);

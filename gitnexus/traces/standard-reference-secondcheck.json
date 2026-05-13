@@ -1,0 +1,499 @@
+{
+  "source": "km.sankuai.com/collabpage/2760949396",
+  "title": "二次验价完整链路 - 标准参考文档",
+  "description": "机票二次验价（生单）链路标准参考，通过代码扫描 + Lotus运行时流量对比生成",
+  "lastUpdated": "2026-05-13",
+  "services": {
+    "api_booking": {
+      "category": "入口网关",
+      "role": "HTTP 接口，构建 Thrift 请求，调 flight-booking-service",
+      "repoPath": "api/booking",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-booking-service", "service": "SecondCheckThriftService", "method": "secondCheck"},
+          {"target": "flight-booking-service", "service": "SecondCheckThriftService", "method": "SpliceSecondCheck"},
+          {"target": "benefits-hub", "service": "ITrafficBenefitsOrderService", "method": "queryUserIdentityAndBenefits", "external": true},
+          {"target": "jinchan", "service": "支付跳转查询", "method": "getPayData"},
+          {"target": "flight-order-core", "service": "UOrderOperateThriftService", "method": "cancelOrder"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-booking-service": {
+      "category": "核心编排",
+      "role": "二次验价主流程编排，协调所有下游",
+      "repoPath": "booking/service",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-booking-support", "service": "TCertificateAuthThriftService", "method": "getUserAuth"},
+          {"target": "flight-booking-support", "service": "ThriftQosService", "method": "getSpecialProductByType"},
+          {"target": "美团用户中心", "service": "UserMergeQueryService", "method": "getMtRealIdByDpUserId", "external": true},
+          {"target": "flight-profit-manager", "service": "RiskService", "method": "queryRiskLevel"},
+          {"target": "flight-biz-selfoperator", "service": "EnrollThriftService", "method": "queryPassengerIsVip"},
+          {"target": "quote_renderer", "service": "FlightInfoThriftService", "method": "queryForceAssignOrder"},
+          {"target": "flight-basis-sim", "service": "CabinSearchService", "method": "cabinSearch"},
+          {"target": "flight-merchant-center", "service": "SiteThriftService", "method": "querySite"},
+          {"target": "flight-booking-support", "service": "SaleIncomeService", "method": "querySaleIncome"},
+          {"target": "flight-basis-malone", "service": "ChannelOfficeThriftService", "method": "getOfficeBySiteId"},
+          {"target": "美团RC风控平台", "service": "RiskEventService", "method": "getRiskLevel", "external": true},
+          {"target": "flight-profit-manager", "service": "RiskService", "method": "matchRiskTagStrategy"},
+          {"target": "flight-biz-selftrade", "service": "SelfOrderQueryThriftService", "method": "getSelfSiteIds"},
+          {"target": "xproduct", "service": "XProductService", "method": "getXProducts"},
+          {"target": "flight-basis-sim", "service": "IdCardWhiteListThriftService", "method": "CZVipIdCardCheck"},
+          {"target": "flight-booking-support", "service": "ThriftQosService", "method": "verifyBizRule"},
+          {"target": "flight-quote-reaching", "service": "TCDispensePreCheckRequest", "method": "preCheck"},
+          {"target": "flight-quote-reaching", "service": "TCActivityListThriftService", "method": "queryActivityList"},
+          {"target": "flight-order-core", "service": "UOrderQueryThriftService", "method": "queryOrder"},
+          {"target": "flight-order-core", "service": "OrderPreSaleThriftService", "method": "generateFlightOrderId"},
+          {"target": "flight-quote-reaching", "service": "TCDispenseThriftService", "method": "dispense"},
+          {"target": "flight-biz-selfoperator", "service": "EnrollThriftService", "method": "enroll"},
+          {"target": "flight-biz-selfoperator", "service": "SendCouponThriftService", "method": "sendCoupon"},
+          {"target": "ota_booking", "service": "ThriftOtaSecondBookingService", "method": "checkOw"},
+          {"target": "ota_booking", "service": "ThriftOtaSecondBookingService", "method": "checkRt"},
+          {"target": "ota_booking", "service": "TTransitSecondCheckService", "method": "checkTransit"},
+          {"target": "flight-biz-selfoperator", "service": "FlagshipCheckpriceThriftService", "method": "checkPrice"},
+          {"target": "flight-biz-selfoperator", "service": "FlagshipOrderThriftService", "method": "createOrder"},
+          {"target": "flight-biz-selfoperator", "service": "OtaService", "method": "directOtaCheck"},
+          {"target": "flight-biz-distribution", "service": "DistributorThriftService", "method": "syncCreateDrOrder"},
+          {"target": "flight-booking-support", "service": "DBookingCheckFeedbackThriftService", "method": "feedback"},
+          {"target": "flight-basis-ibeplus", "service": "BookingService", "method": "av"},
+          {"target": "flight-basis-sim", "service": "BaggageThriftService", "method": "getBaggageByParams"},
+          {"target": "benefits-hub", "service": "ITrafficBenefitsOrderService", "method": "createCarrierBenefitsOrder", "external": true},
+          {"target": "xorder", "service": "XOrderService", "method": "create"},
+          {"target": "flight-order-core", "service": "OrderPreSaleThriftService", "method": "createFlightOrder"},
+          {"target": "flight-order-core", "service": "UOrderOperateThriftService", "method": "updateOrderTag"},
+          {"target": "flight-order-core", "service": "OrderPreSaleThriftService", "method": "saveRefundActivity"},
+          {"target": "benefits-hub", "service": "ITrafficBenefitsOrderService", "method": "createPlatformMemberRightsOrder", "external": true},
+          {"target": "flight-order-core", "service": "OrderPreSaleThriftService", "method": "saveYouthCardNumber"},
+          {"target": "xorder", "service": "XOrderService", "method": "bind"},
+          {"target": "flight-aftersale-express", "service": "ExpressThriftService", "method": "createExpress"},
+          {"target": "meituan-train-wisdomtraffic", "service": "TrafficRouteService", "method": "createWisdomTrafficOrder", "external": true},
+          {"target": "潘多拉立减平台", "service": "PandoraClient", "method": "pandoraCheck", "external": true},
+          {"target": "美团外卖学生认证", "service": "CampusMemberService", "method": "studentValidate", "external": true}
+        ],
+        "outbound_mq": [
+          {"topic": "booking.order.cancel.delayq", "direction": "send", "description": "延迟取消消息"},
+          {"topic": "flight_order_risk_tag_notify", "direction": "send", "description": "风险标签通知→诸葛系统", "external": true}
+        ]
+      }
+    },
+    "ota_booking": {
+      "category": "OTA验价",
+      "role": "OTA 侧生编（SS/RT）+ PATA验价，调中航信",
+      "repoPath": "booking/ota",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-basis-malone", "service": "BookingService", "method": "ss"},
+          {"target": "flight-basis-malone", "service": "BookingService", "method": "ssAndPata"},
+          {"target": "flight-basis-malone", "service": "BookingService", "method": "rtV2"},
+          {"target": "flight-basis-malone", "service": "InitiativeBookingService", "method": "newSs"},
+          {"target": "flight-basis-malone", "service": "InitiativeBookingService", "method": "directUseOrSs"},
+          {"target": "flight-basis-malone", "service": "BookingService", "method": "pataLockFare"},
+          {"target": "adaptor", "service": "TOwCheckPriceService", "method": "checkOwSample"},
+          {"target": "adaptor", "service": "TOwCheckPriceService", "method": "checkOwGroupPack"},
+          {"target": "flight-basis-malone", "service": "SiteTravelSkyChannelService", "method": "querySiteTravelSkyStatus"},
+          {"target": "flight-booking-support", "service": "DOtaBookingFeedbackThriftService", "method": "owFeedback"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-malone": {
+      "category": "GDS接入",
+      "role": "SS/RT 生编，路由到 IBE+ 或 eTerm",
+      "repoPath": "basis/malone",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "IBE+(中航信)", "service": "linkstarDomesticOrderThriftService", "method": "airBook", "external": true},
+          {"target": "IBE+(中航信)", "service": "linkstarDomesticOrderThriftService", "method": "rt", "external": true},
+          {"target": "IBE+(中航信)", "service": "linkstarDomesticOrderThriftService", "method": "xe", "external": true},
+          {"target": "eTerm(中航信)", "service": "sGuiBookingService", "method": "ss", "external": true},
+          {"target": "eTerm(中航信)", "service": "sGuiBookingService", "method": "rtV2", "external": true},
+          {"target": "flight-basis-avdc", "service": "AvdcDomService", "method": "queryOwAvCacheData"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-ibeplus": {
+      "category": "AV查询",
+      "role": "AV 库存查询，HTTP/OTA XML 打到 IBE+",
+      "repoPath": "basis/ibeplus",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "IBE+(travelsky)", "service": "HTTP", "method": "POST /ota/xml/AirAvail/A", "external": true},
+          {"target": "flight-basis-etermservice", "service": "BookingService(eTerm inner)", "method": "pnrAuth", "external": true}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-order-core": {
+      "category": "订单核心",
+      "role": "创建 U单/M单，发送订单变更 MQ",
+      "repoPath": "order/core",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-quote-reaching", "service": "TCCouponOperateThriftService", "method": "use"},
+          {"target": "flight-quote-reaching", "service": "TCCouponOperateThriftService", "method": "useConfirm"},
+          {"target": "flight-quote-reaching", "service": "TCCouponOperateThriftService", "method": "release"},
+          {"target": "flight-quote-reaching", "service": "TCDispenseThriftService", "method": "dispense"},
+          {"target": "flight-merchant-center", "service": "SiteThriftService", "method": "querySite"},
+          {"target": "flight-biz-selfoperator", "service": "FlagshipWithholdSupplyThriftService", "method": "supplyRecord"},
+          {"target": "jinchan", "service": "CreatePayTService", "method": "splitAccount"},
+          {"target": "flight-basis-sim", "service": "CityThriftService", "method": "getCity"},
+          {"target": "flight-basis-sim", "service": "AirportThriftService", "method": "getAirport"}
+        ],
+        "outbound_mq": [
+          {"topic": "orderChangeNotify", "direction": "send", "description": "生单成功通知"},
+          {"topic": "need_ticket", "direction": "send", "description": "出票通知"},
+          {"topic": "u_order_notify_status", "direction": "send", "description": "订单状态变更"},
+          {"topic": "u_iorder_notify_status", "direction": "send", "description": "国际订单状态变更"},
+          {"topic": "u_order_push_travel", "direction": "send", "description": "行程推送→行程中心", "external": true},
+          {"topic": "update_order_risk_tag", "direction": "receive", "description": "风险标签更新（来自诸葛系统）", "external": true}
+        ]
+      }
+    },
+    "flight-booking-support-service": {
+      "category": "预订支撑",
+      "role": "实名认证查询、验价回馈",
+      "repoPath": "booking/support",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-profit-manager": {
+      "category": "风控",
+      "role": "出票退差风控、代理商货风险标签匹配",
+      "repoPath": "business/profit",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-selfoperator": {
+      "category": "旗舰店",
+      "role": "旗舰店验价生单、航司会员注册/里程",
+      "repoPath": "biz/selfoperator",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-biz-flagshipapi", "service": "FlagshipCheckpriceThriftService", "method": "checkPrice"},
+          {"target": "flight-biz-flagshipapi", "service": "FlagshipOrderThriftService", "method": "createOrder"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-quote-reaching": {
+      "category": "营销",
+      "role": "营销活动分配（券码发放/核销）",
+      "repoPath": "quote/reaching",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "marketing-agency", "service": "优惠台代理框架", "method": "dispense/use"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "xorder": {
+      "category": "X订单",
+      "role": "X产品订单创建",
+      "repoPath": "trade/order",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "xproduct", "service": "XProductService", "method": "lock"},
+          {"target": "jinchan", "service": "CreatePayTService", "method": "splitAccount"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "xproduct": {
+      "category": "X产品",
+      "role": "X产品查询、库存锁定/扣减",
+      "repoPath": "trade/product",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-aftersale-express": {
+      "category": "配送",
+      "role": "行程单配送创建",
+      "repoPath": "aftersale/express",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-order-core", "service": "OrderPreSaleThriftService", "method": "query"},
+          {"target": "flight-basis-sim", "service": "快递订阅", "method": "subscribe"},
+          {"target": "jinchan", "service": "支付服务", "method": "createPay"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-distribution": {
+      "category": "分销",
+      "role": "[条件] 分销反采生单",
+      "repoPath": "merchant/distribution",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-booking-service", "service": "SecondCheckThriftService", "method": "secondCheck"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "quote_renderer": {
+      "category": "报价渲染",
+      "role": "[派单] 报价重搜",
+      "repoPath": "eng/renderer",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "adaptor", "service": "报价搜索", "method": "search"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-sim": {
+      "category": "基础数据",
+      "role": "行李额、舱位级别、白名单、快递订阅（实际提供者在 basis/staticdata 仓库，非 simpool）",
+      "repoPath": "basis/staticdata",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-avdc": {
+      "category": "库存",
+      "role": "AV 库存缓存刷新",
+      "repoPath": "basis/avdc",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-merchant-center": {
+      "category": "站点配置",
+      "role": "站点配置查询",
+      "repoPath": "merchant/center",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-order-customer": {
+      "category": "订单聚合",
+      "role": "订单聚合查询",
+      "repoPath": "order/customer",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "jinchan": {
+      "category": "支付",
+      "role": "支付交易创建、分账",
+      "repoPath": "business/jinchan",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "美团收银台", "service": "支付网关", "method": "createPay"},
+          {"target": "易宝", "service": "支付网关", "method": "createPay"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "marketing-agency": {
+      "category": "优惠券",
+      "role": "券码分配/核销",
+      "repoPath": "quote/msgreach",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "benefits-hub": {
+      "category": "权益",
+      "role": "创建平台会员权益单、航司权益单",
+      "repoPath": null,
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-flagshipapi": {
+      "category": "航司API",
+      "role": "航司验价生单/会员注册/里程",
+      "repoPath": "flagship/api",
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [
+          {"target": "flight-biz-flagshipbusiness", "service": "验价/生单/支付/售后/会员", "method": "multiple"},
+          {"target": "flight-biz-flagshipdailishang", "service": "OTA搜索/验舱/生单", "method": "multiple"},
+          {"target": "flight-biz-flagshipfare", "service": "兜底验价/报价查询", "method": "multiple"}
+        ],
+        "outbound_mq": []
+      }
+    },
+    "adaptor": {
+      "category": "报价适配",
+      "role": "Galaxy 价格计算、派单报价搜索",
+      "repoPath": "eng/adaptor",
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-fare": {
+      "category": "运价服务",
+      "role": "公布/私有运价搜索、Shopping数据管理",
+      "repoPath": "basis/fare",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-ei": {
+      "category": "退改签规则",
+      "role": "退改签费用计算、规则格式化、行李额查询",
+      "repoPath": "basis/ei",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-flagshipbusiness": {
+      "category": "旗舰店业务",
+      "role": "flagshipapi下游，验价/生单/支付/售后/会员",
+      "repoPath": "flagship/business",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-flagshipdailishang": {
+      "category": "旗舰店代理商",
+      "role": "OTA搜索/验舱/生单/支付校验/丢单通知",
+      "repoPath": "flagship/dailishang",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-flagshipfare": {
+      "category": "旗舰店运价",
+      "role": "兜底验价/报价查询/报价更新",
+      "repoPath": "flagship/fare",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-order-search": {
+      "category": "订单搜索",
+      "role": "ES订单搜索，用户单/商户单查询、操作日志",
+      "repoPath": "order/search",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-selftrade": {
+      "category": "自营交易",
+      "role": "自营出票/退票/改签履约、支付流水",
+      "repoPath": "merchant/selftrade",
+      "localRepo": true,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-biz-merchant": {
+      "category": "商户管理",
+      "role": "站点状态/渠道配置查询",
+      "repoPath": null,
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "meituan-train-wisdomtraffic": {
+      "category": "智能出行",
+      "role": "[条件] 机火联运订单绑定",
+      "repoPath": null,
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-linkstar": {
+      "category": "IBE+渠道",
+      "role": "malone下游，与中航信IBE+系统直连通信",
+      "repoPath": null,
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-etermproxy": {
+      "category": "eTerm配置",
+      "role": "eTerm配置代理，站点Office授权查询",
+      "repoPath": "basis/eterm-proxy",
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    },
+    "flight-basis-etermservice": {
+      "category": "eTerm管理",
+      "role": "eTerm PID管理，全量PID配置查询",
+      "repoPath": null,
+      "localRepo": false,
+      "interfaces": {
+        "outbound_rpc": [],
+        "outbound_mq": []
+      }
+    }
+  },
+  "summary": {
+    "total_services": 36,
+    "local_repo_services": 26,
+    "external_services": 10,
+    "total_rpc_calls": 87,
+    "total_mq_topics": 9,
+    "external_rpc_calls": 15,
+    "bfs_unreachable_calls": 1,
+    "layers": {
+      "L1": "用户端 → api_booking（HTTP REST）",
+      "L2": "api_booking → flight-booking-service（Thrift RPC, port 9010）",
+      "L3": "flight-booking-service → ota_booking / flight-order-core / xorder 等（Thrift RPC）",
+      "L4": "ota_booking → flight-basis-malone → 中航信GDS（IBE+/eTerm）"
+    }
+  }
+}

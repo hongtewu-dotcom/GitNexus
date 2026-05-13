@@ -221,6 +221,15 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
 
           if (config.detect.includes) {
             const extracted = await includeEx.extract(executor, handle.repoPath, handle);
+            for (const c of extracted) {
+              autoContracts.push({
+                ...c,
+                repo: groupPath,
+                service: assignService(c.symbolRef.filePath, boundaries),
+              });
+            }
+          }
+
           // Mafka properties extraction (complementary to tree-sitter topic patterns)
           if (config.detect.topics) {
             const extracted = await mafkaEx.extract(executor, handle.repoPath, handle);
