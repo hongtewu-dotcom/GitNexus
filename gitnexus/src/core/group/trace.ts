@@ -331,6 +331,31 @@ async function resolveEntrySymbol(
   repoId: string,
   target: string,
 ): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
+  const results = await resolveEntrySymbols(repoId, target);
+  return results.length > 0 ? results[0] : null;
+}
+
+/**
+ * Resolve ALL viable entry symbols for multi-seed BFS.
+ *
+ * Returns multiple candidates when a method name has several non-trivial
+ * implementations in the repo (e.g. interface dispatch via factory pattern,
+ * multiple version implementations). This allows BFS to start from all
+ * reachable entry points and cover branches that a single-seed BFS would miss.
+ *
+ * Filtering rules:
+ *   - Exclude test files, client/IDL modules, utility/DTO classes
+ *   - Exclude candidates scoring below a threshold (topScore - 100)
+ *   - Cap at MAX_SEEDS to avoid BFS explosion
+ *   - Deduplicate by graph id (after drillDownToMethod)
+ */
+async function resolveEntrySymbols(
+  repoId: string,
+  target: string,
+): Promise<{ id: string; name: string; type: string; filePath: string }[]> {
+  const MAX_SEEDS = 5;
+  const SCORE_THRESHOLD_OFFSET = 100; // include candidates within 100 points of top score
+
   // Try exact id match first (unique, no scoring needed)
   const exactRows = await executeParameterized(
     repoId,
@@ -347,7 +372,8 @@ async function resolveEntrySymbol(
       type: r.type ?? r[2],
       filePath: r.filePath ?? r[3],
     };
-    return drillDownToMethod(repoId, matched);
+    const drilled = await drillDownToMethod(repoId, matched);
+    return [drilled];
   }
 
   // Fetch ALL candidates matching by name (no LIMIT 1)
@@ -357,7 +383,7 @@ async function resolveEntrySymbol(
      RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
     { target },
   );
-  if (nameRows.length === 0) return null;
+  if (nameRows.length === 0) return [];
 
   const candidates: SymbolCandidate[] = nameRows.map((r: Record<string, unknown>) => ({
     id: (r.id ?? r[0]) as string,
@@ -367,18 +393,61 @@ async function resolveEntrySymbol(
   }));
 
   // Single candidate — no scoring needed
-  if (candidates.length === 1) return drillDownToMethod(repoId, candidates[0]);
+  if (candidates.length === 1) {
+    const drilled = await drillDownToMethod(repoId, candidates[0]);
+    return [drilled];
+  }
 
-  // Score and pick the best candidate (pass target for semantic relevance)
+  // Score all candidates
   candidates.sort((a, b) => scoreCandidate(b, undefined, target) - scoreCandidate(a, undefined, target));
+  const topScore = scoreCandidate(candidates[0], undefined, target);
+  const scoreThreshold = topScore - SCORE_THRESHOLD_OFFSET;
 
-  const best = candidates[0];
-  logger.info(
-    `[trace] resolveEntrySymbol "${target}": ${candidates.length} candidates, ` +
-    `selected "${best.id}" (score=${scoreCandidate(best, undefined, target)}) over ${candidates.slice(1, 4).map(c => `"${c.id}"(${scoreCandidate(c, undefined, target)})`).join(', ')}${candidates.length > 4 ? ` ... and ${candidates.length - 4} more` : ''}`,
-  );
+  // Select all viable candidates above threshold (excluding negatives which
+  // indicate test/client/utility classes)
+  const viable = candidates.filter((c) => {
+    const s = scoreCandidate(c, undefined, target);
+    if (s < scoreThreshold) return false;
+    if (s < 0) return false; // hard floor: skip clearly bad candidates
+    if (isTestFilePath(c.filePath)) return false;
+    if (isClientModulePath(c.filePath)) return false;
+    if (isUtilOrDto(c)) return false;
+    if (isIfaceOrThriftDef(c)) return false;
+    return true;
+  });
 
-  return drillDownToMethod(repoId, best);
+  if (viable.length === 0) {
+    // Fall back to the single best candidate even if it scored below threshold
+    const best = candidates[0];
+    const drilled = await drillDownToMethod(repoId, best);
+    return [drilled];
+  }
+
+  // Drill down each viable candidate to a Method node, dedup by id
+  const results: { id: string; name: string; type: string; filePath: string }[] = [];
+  const seenIds = new Set<string>();
+  for (const c of viable.slice(0, MAX_SEEDS)) {
+    const drilled = await drillDownToMethod(repoId, c);
+    if (!seenIds.has(drilled.id)) {
+      seenIds.add(drilled.id);
+      results.push(drilled);
+    }
+  }
+
+  if (results.length > 1) {
+    logger.info(
+      `[trace] resolveEntrySymbols "${target}": ${candidates.length} total candidates, ` +
+      `${results.length} seeds selected: ${results.map(r => `"${r.id}"`).join(', ')} ` +
+      `(threshold=${scoreThreshold}, top=${topScore})`,
+    );
+  } else {
+    logger.info(
+      `[trace] resolveEntrySymbols "${target}": ${candidates.length} candidates, ` +
+      `selected "${results[0]?.id}" (score=${topScore}) over ${candidates.slice(1, 4).map(c => `"${c.id}"(${scoreCandidate(c, undefined, target)})`).join(', ')}${candidates.length > 4 ? ` ... and ${candidates.length - 4} more` : ''}`,
+    );
+  }
+
+  return results;
 }
 
 /**
@@ -1262,17 +1331,19 @@ export async function runGroupTrace(
   await initLbug(entryRepo.id, entryDbPath);
   openedRepoIds.push(entryRepo.id);
 
-  // Resolve entry symbol
-  const entrySym = await resolveEntrySymbol(entryRepo.id, target);
-  if (!entrySym) {
+  // Resolve entry symbols (multi-seed: all viable implementations)
+  const entrySyms = await resolveEntrySymbols(entryRepo.id, target);
+  if (entrySyms.length === 0) {
     return { error: `Symbol "${target}" not found in repo "${entryRepoPath}".` };
   }
 
-  // BFS within entry repo
+  // BFS within entry repo — seed from ALL resolved entry symbols
+  const seedIds = entrySyms.map((s) => s.id);
+  const seedFilePaths = entrySyms.filter((s) => s.filePath).map((s) => s.filePath);
   const bfsResult = await intraRepoBFS(
     entryRepo.id,
-    [entrySym.id],
-    entrySym.filePath ? [entrySym.filePath] : [],
+    seedIds,
+    seedFilePaths,
     direction,
     { maxDepth, relationTypes, includeTests, minConfidence },
   );
@@ -1287,7 +1358,7 @@ export async function runGroupTrace(
   segments.push({
     repo: entryRegistryName,
     repoPath: entryRepoPath,
-    entrySymbolUid: entrySym.id,
+    entrySymbolUid: entrySyms[0].id,
     nodes: entryNodes,
     crossHops: entryCrossHops,
   });
