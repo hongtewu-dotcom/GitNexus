@@ -56,6 +56,7 @@ import {
   javaArityCompatibility,
   javaMergeBindings,
   resolveJavaImportTarget,
+  javaEmitUnresolvedReceiverEdges,
   type JavaResolveContext,
 } from './index.js';
 
@@ -92,6 +93,11 @@ const javaScopeResolver: ScopeResolver = {
 
   // Hoist return-type bindings to Module scope for cross-file propagation
   hoistTypeBindingsToModule: true,
+
+  // Synthetic CALLS edges for Java dynamic dispatch patterns:
+  //   A) new XxxDispatcher(...).dispatch(...)  — constructor delegation
+  //   B) @Autowired Map<String, XxxInterface> — Spring map injection
+  emitUnresolvedReceiverEdges: javaEmitUnresolvedReceiverEdges,
 };
 
 export { javaScopeResolver };

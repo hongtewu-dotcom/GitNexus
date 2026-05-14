@@ -28,3 +28,4 @@ export { javaMergeBindings } from './merge-bindings.js';
 export { javaArityCompatibility } from './arity.js';
 export { resolveJavaImportTarget, type JavaResolveContext } from './import-target.js';
 export { javaBindingScopeFor, javaImportOwningScope, javaReceiverBinding } from './simple-hooks.js';
+export { javaEmitUnresolvedReceiverEdges } from './unresolved-receiver.js';

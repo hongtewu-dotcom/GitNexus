@@ -37,6 +37,7 @@ import {
   javaReceiverBinding,
   javaArityCompatibility,
   resolveJavaImportTarget,
+  javaEmitUnresolvedReceiverEdges,
 } from './java/index.js';
 
 export const javaProvider = defineLanguage({
