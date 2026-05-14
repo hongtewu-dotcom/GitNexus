@@ -25,6 +25,9 @@ import { GroupNotFoundError, loadGroupConfig } from './config-parser.js';
 import { getGroupDir, readContractRegistry } from './storage.js';
 import { initLbug, executeParameterized, closeLbug } from '../lbug/pool-adapter.js';
 import { logger } from '../logger.js';
+import type { SymbolResolver, SymbolCandidate, ResolvedSymbol } from './trace-resolver.js';
+
+export type { SymbolResolver, SymbolCandidate, ResolvedSymbol } from './trace-resolver.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -51,11 +54,13 @@ export interface TraceCrossHop {
     repo: string;
     symbolUid: string;
     symbolName: string;
+    symbolFilePath?: string;
   };
   to: {
     repo: string;
     symbolUid: string;
     symbolName: string;
+    symbolFilePath?: string;
   };
 }
 
@@ -140,18 +145,8 @@ function isTestFilePath(fp: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Candidate scoring helpers (shared by resolveEntrySymbol & resolveByName)
+// Generic candidate helpers (framework-agnostic)
 // ---------------------------------------------------------------------------
-
-type SymbolCandidate = { id: string; name: string; type: string; filePath: string };
-
-/** Extract type from node id prefix (e.g. "Method:..." → "Method"). */
-function effectiveType(c: SymbolCandidate): string {
-  if (c.type) return c.type;
-  const colonIdx = c.id.indexOf(':');
-  if (colonIdx > 0) return c.id.slice(0, colonIdx);
-  return '';
-}
 
 /** Detect utility/DTO/enum classes that are poor BFS entry points. */
 function isUtilOrDto(c: SymbolCandidate): boolean {
@@ -173,190 +168,44 @@ function isUtilOrDto(c: SymbolCandidate): boolean {
     combined.includes('logutil');
 }
 
-/** Detect Thrift Iface / interface definitions (dead-end for BFS). */
-function isIfaceOrThriftDef(c: SymbolCandidate): boolean {
-  if (c.id.includes('Iface.') || c.id.includes(':Iface.')) return true;
-  const fp = c.filePath || '';
-  if (fp.includes('-thrift/') || fp.includes('_thrift/')) return true;
+/**
+ * Check if a file path belongs to a client/IDL/thrift-common module.
+ * These modules contain interface definitions that are dead-ends for BFS (no CALLS edges).
+ */
+function isClientModulePath(filePath: string): boolean {
+  if (!filePath) return false;
+  const fp = filePath.toLowerCase();
+  if (fp.includes('-client/') || fp.includes('-client-') || fp.includes('_client/') ||
+    fp.includes('-thrift-common/') || fp.includes('-thrift-inner/') ||
+    fp.includes('/idl/') || fp.endsWith('.thrift')) return true;
+  if (/-api\//.test(fp)) return true;
+  if (/[_-]client\d/.test(fp)) return true;
   return false;
 }
 
 /**
- * Score a candidate symbol for BFS entry quality.
- * Higher = better entry point.
- * @param classVariants  Optional class-name variants for fuzzy matching.
- * @param target  Optional original target name for semantic relevance scoring.
- */
-function scoreCandidate(c: SymbolCandidate, classVariants?: string[], target?: string): number {
-  let s = 0;
-  const idAndPath = `${c.id}|${c.filePath}`;
-
-  if (classVariants) {
-    for (const variant of classVariants) {
-      if (idAndPath.includes(variant)) { s += 100; break; }
-    }
-  }
-
-  const nodeType = effectiveType(c);
-  if (nodeType === 'Method') s += 10;
-
-  if (c.filePath && (c.filePath.includes('-server/') || c.filePath.includes('-service/'))) {
-    s += 50;
-  }
-  if (c.filePath && (c.filePath.toLowerCase().includes('impl') || c.filePath.includes('-impl/'))) {
-    s += 20;
-  }
-
-  // Thrift server entry points: strongly prefer classes named *ThriftServer*,
-  // *ThriftServiceImpl*, *RpcServiceImpl* — these are RPC entry facades.
-  const idLowerForThrift = c.id.toLowerCase();
-  if (idLowerForThrift.includes('thriftserver') || idLowerForThrift.includes('thriftserviceimpl') ||
-      idLowerForThrift.includes('rpcserviceimpl')) {
-    s += 30;
-  }
-  // Penalize gateway/delegate/adapter patterns (less likely primary entry)
-  if (/gateway|delegate|adapter|proxy|wrapper/i.test(c.id)) {
-    s -= 15;
-  }
-
-  // Semantic relevance: when a target name is provided, check if the class/file
-  // name contains the PascalCase version of the target (e.g. target "secondCheck"
-  // → PascalCase "SecondCheck" → prefer SecondCheckThriftServer over Reschedule*).
-  if (target && target.length > 0) {
-    const pascalTarget = target[0].toUpperCase() + target.slice(1); // "secondCheck" → "SecondCheck"
-    if (idAndPath.includes(pascalTarget)) {
-      s += 40;
-    }
-  }
-
-  if (isIfaceOrThriftDef(c)) s -= 200;
-
-  if (c.filePath && (c.filePath.includes('-client/') || c.filePath.includes('-client-'))) {
-    s -= 60;
-  }
-
-  if (isUtilOrDto(c)) s -= 80;
-
-  if (isTestFilePath(c.filePath)) s -= 50;
-
-  return s;
-}
-
-/**
- * Given a Class/Interface/Constructor node, drill down to a Method node in the
- * same file that is a better BFS seed (because BFS follows CALLS edges which
- * only exist between Method nodes, not from Class nodes).
- *
- * For Thrift entry points (e.g. SecondCheckThriftServer), prefers the public
- * method whose name matches common RPC handler patterns. Falls back to any
- * Method in the file if no well-known handler is found.
- *
- * Returns the original node unchanged if it is already a Method, or if no
- * Method nodes exist in the same file.
- */
-async function drillDownToMethod(
-  repoId: string,
-  node: { id: string; name: string; type: string; filePath: string },
-): Promise<{ id: string; name: string; type: string; filePath: string }> {
-  // Already a Method — nothing to do
-  if (node.id.startsWith('Method:')) return node;
-  if (!node.filePath) return node;
-
-  const methods = await executeParameterized(
-    repoId,
-    `MATCH (m:Method) WHERE m.filePath = $fp
-     RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
-    { fp: node.filePath },
-  );
-  if (methods.length === 0) return node;
-
-  // Well-known handler method names (covers Thrift RPC + MQ consumers)
-  const handlerNames = new Set([
-    'handleMessage', 'onRecvMessage', 'consume', 'onMessage',
-    'process', 'execute', 'run',
-    // Thrift RPC entry methods often share the service class name
-    // but we don't know the exact name here — fall back to scoring
-  ]);
-
-  // Prefer handler methods, then score by implementation quality
-  let bestMethod: Record<string, unknown> | null = null;
-  let bestScore = -Infinity;
-
-  for (const m of methods) {
-    const mName = (m.name ?? m[1]) as string;
-    const mId = (m.id ?? m[0]) as string;
-    let score = 0;
-
-    if (handlerNames.has(mName)) score += 100;
-    // Prefer methods that contain the class name (e.g. secondCheck in SecondCheckThriftServer)
-    if (mId.includes('Impl') || mId.includes('Server')) score += 20;
-    // Penalize getters/setters/toString/hashCode
-    if (/^(get|set|is|toString|hashCode|equals)/.test(mName)) score -= 50;
-    // Penalize constructors leaked as Method nodes
-    if (mName === '<init>' || mName === '<clinit>') score -= 100;
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMethod = m;
-    }
-  }
-
-  if (!bestMethod) bestMethod = methods[0];
-
-  const result = {
-    id: (bestMethod.id ?? bestMethod[0]) as string,
-    name: (bestMethod.name ?? bestMethod[1]) as string,
-    type: (bestMethod.type ?? bestMethod[2]) as string,
-    filePath: (bestMethod.filePath ?? bestMethod[3]) as string,
-  };
-
-  logger.info(
-    `[trace] drillDownToMethod: "${node.id}" → "${result.id}" (${methods.length} methods in file)`,
-  );
-
-  return result;
-}
-
-/** Resolve a symbol name/file to its lbug node id.
- *
- * When multiple candidates match by name, uses the same scoring logic as
- * resolveByName to prefer implementation classes over client interfaces,
- * Method nodes over Class nodes, and -server/ paths over -client/ paths.
- *
- * If the resolved symbol is a Class/Interface/Constructor node, automatically
- * drills down to a Method node in the same file so that BFS (which requires
- * CALLS edges) can proceed.
- */
-async function resolveEntrySymbol(
-  repoId: string,
-  target: string,
-): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  const results = await resolveEntrySymbols(repoId, target);
-  return results.length > 0 ? results[0] : null;
-}
-
-/**
  * Resolve ALL viable entry symbols for multi-seed BFS.
- *
- * Returns multiple candidates when a method name has several non-trivial
- * implementations in the repo (e.g. interface dispatch via factory pattern,
- * multiple version implementations). This allows BFS to start from all
- * reachable entry points and cover branches that a single-seed BFS would miss.
- *
- * Filtering rules:
- *   - Exclude test files, client/IDL modules, utility/DTO classes
- *   - Exclude candidates scoring below a threshold (topScore - 100)
- *   - Cap at MAX_SEEDS to avoid BFS explosion
- *   - Deduplicate by graph id (after drillDownToMethod)
+ * Uses resolver.scoreCandidate and resolver.drillDownToMethod for framework-aware selection.
  */
 async function resolveEntrySymbols(
   repoId: string,
   target: string,
-): Promise<{ id: string; name: string; type: string; filePath: string }[]> {
+  resolver: SymbolResolver,
+): Promise<ResolvedSymbol[]> {
   const MAX_SEEDS = 5;
-  const SCORE_THRESHOLD_OFFSET = 100; // include candidates within 100 points of top score
+  const SCORE_THRESHOLD_OFFSET = 100;
+  const lastDot = target.lastIndexOf('.');
+  const preferredMethod = lastDot >= 0 ? target.slice(lastDot + 1) : target;
 
-  // Try exact id match first (unique, no scoring needed)
+  const drillDown = (node: SymbolCandidate) =>
+    resolver.drillDownToMethod
+      ? resolver.drillDownToMethod(repoId, node, preferredMethod)
+      : Promise.resolve(node);
+
+  const score = (c: SymbolCandidate, variants?: string[]) =>
+    resolver.scoreCandidate ? resolver.scoreCandidate(c, variants, target) : 0;
+
+  // Exact id match — skip scoring
   const exactRows = await executeParameterized(
     repoId,
     `MATCH (n) WHERE n.id = $target
@@ -366,17 +215,10 @@ async function resolveEntrySymbols(
   );
   if (exactRows.length > 0) {
     const r = exactRows[0];
-    const matched = {
-      id: r.id ?? r[0],
-      name: r.name ?? r[1],
-      type: r.type ?? r[2],
-      filePath: r.filePath ?? r[3],
-    };
-    const drilled = await drillDownToMethod(repoId, matched);
-    return [drilled];
+    const matched: SymbolCandidate = { id: r.id ?? r[0], name: r.name ?? r[1], type: r.type ?? r[2], filePath: r.filePath ?? r[3] };
+    return [await drillDown(matched)];
   }
 
-  // Fetch ALL candidates matching by name (no LIMIT 1)
   const nameRows = await executeParameterized(
     repoId,
     `MATCH (n) WHERE n.name = $target
@@ -392,42 +234,27 @@ async function resolveEntrySymbols(
     filePath: (r.filePath ?? r[3]) as string,
   }));
 
-  // Single candidate — no scoring needed
-  if (candidates.length === 1) {
-    const drilled = await drillDownToMethod(repoId, candidates[0]);
-    return [drilled];
-  }
+  if (candidates.length === 1) return [await drillDown(candidates[0])];
 
-  // Score all candidates
-  candidates.sort((a, b) => scoreCandidate(b, undefined, target) - scoreCandidate(a, undefined, target));
-  const topScore = scoreCandidate(candidates[0], undefined, target);
+  candidates.sort((a, b) => score(b) - score(a));
+  const topScore = score(candidates[0]);
   const scoreThreshold = topScore - SCORE_THRESHOLD_OFFSET;
 
-  // Select all viable candidates above threshold (excluding negatives which
-  // indicate test/client/utility classes)
   const viable = candidates.filter((c) => {
-    const s = scoreCandidate(c, undefined, target);
-    if (s < scoreThreshold) return false;
-    if (s < 0) return false; // hard floor: skip clearly bad candidates
+    const s = score(c);
+    if (s < scoreThreshold || s < 0) return false;
     if (isTestFilePath(c.filePath)) return false;
     if (isClientModulePath(c.filePath)) return false;
     if (isUtilOrDto(c)) return false;
-    if (isIfaceOrThriftDef(c)) return false;
     return true;
   });
 
-  if (viable.length === 0) {
-    // Fall back to the single best candidate even if it scored below threshold
-    const best = candidates[0];
-    const drilled = await drillDownToMethod(repoId, best);
-    return [drilled];
-  }
+  const pool = viable.length > 0 ? viable : [candidates[0]];
 
-  // Drill down each viable candidate to a Method node, dedup by id
-  const results: { id: string; name: string; type: string; filePath: string }[] = [];
+  const results: ResolvedSymbol[] = [];
   const seenIds = new Set<string>();
-  for (const c of viable.slice(0, MAX_SEEDS)) {
-    const drilled = await drillDownToMethod(repoId, c);
+  for (const c of pool.slice(0, MAX_SEEDS)) {
+    const drilled = await drillDown(c);
     if (!seenIds.has(drilled.id)) {
       seenIds.add(drilled.id);
       results.push(drilled);
@@ -436,14 +263,12 @@ async function resolveEntrySymbols(
 
   if (results.length > 1) {
     logger.info(
-      `[trace] resolveEntrySymbols "${target}": ${candidates.length} total candidates, ` +
-      `${results.length} seeds selected: ${results.map(r => `"${r.id}"`).join(', ')} ` +
-      `(threshold=${scoreThreshold}, top=${topScore})`,
+      `[trace] resolveEntrySymbols "${target}": ${candidates.length} total, ` +
+      `${results.length} seeds: ${results.map(r => `"${r.id}"`).join(', ')} (threshold=${scoreThreshold})`,
     );
   } else {
     logger.info(
-      `[trace] resolveEntrySymbols "${target}": ${candidates.length} candidates, ` +
-      `selected "${results[0]?.id}" (score=${topScore}) over ${candidates.slice(1, 4).map(c => `"${c.id}"(${scoreCandidate(c, undefined, target)})`).join(', ')}${candidates.length > 4 ? ` ... and ${candidates.length - 4} more` : ''}`,
+      `[trace] resolveEntrySymbols "${target}": ${candidates.length} candidates, selected "${results[0]?.id}" (score=${topScore})`,
     );
   }
 
@@ -451,436 +276,12 @@ async function resolveEntrySymbols(
 }
 
 /**
- * Quick check: is this symbolName clearly NOT a resolvable Java symbol?
- * Returns true for synthetic names generated by non-RPC extractors (topic/mafka,
- * squirrel, crane) that will never exist in LadybugDB.
- *
- * Patterns rejected:
- *   - mafkaProducer(...) / mafkaConsumer(...)
- *   - kafkaListener, kafkaTemplate.send, rabbitTemplate.convertAndSend
- *   - MdpMafkaConsumer, MdpMafkaProducer, ConsumeMessage
- *   - squirrel property keys (contain dots but start with lowercase, e.g. "squirrel.fare.fd.category.name")
- *   - crane.task.xxx / methodName@taskName
- */
-function isUnresolvableSymbolName(symbolName: string): boolean {
-  // mafkaProducer(...) / mafkaConsumer(...)
-  if (/^mafka(?:Producer|Consumer)\(/.test(symbolName)) return true;
-  // Well-known topic extractor synthetic names
-  if (
-    symbolName === 'kafkaListener' ||
-    symbolName === 'kafkaTemplate.send' ||
-    symbolName === 'rabbitTemplate.convertAndSend' ||
-    symbolName === 'MdpMafkaConsumer' ||
-    symbolName === 'MdpMafkaProducer' ||
-    symbolName === 'ConsumeMessage' ||
-    symbolName === 'rabbitListener'
-  ) return true;
-  // crane: "methodName@taskName" or "crane.task.xxx"
-  if (symbolName.includes('@') || symbolName.startsWith('crane.task.')) return true;
-  // squirrel property keys: "squirrel.xxx" or multi-dot lowercase path (>= 3 dots)
-  if (symbolName.startsWith('squirrel.')) return true;
-  if ((symbolName.match(/\./g) ?? []).length >= 3 && symbolName[0] === symbolName[0].toLowerCase()) return true;
-  return false;
-}
-
-/**
- * Tokenize a symbol name (PascalCase, camelCase, or snake_case) into lowercase tokens.
- * "Event_report_listener" → ["event", "report", "listener"]
- * "MOrderStatusChangeProcess" → ["m", "order", "status", "change", "process"]
- * "OrderStatusListener" → ["order", "status", "listener"]
- */
-function tokenizeSymbolName(name: string): string[] {
-  // Replace underscores with spaces, then split on PascalCase boundaries
-  const normalized = name.replace(/_/g, ' ');
-  const tokens = normalized
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    .split(/\s+/)
-    .map((t) => t.toLowerCase())
-    .filter((t) => t.length > 0);
-  return tokens;
-}
-
-/** Common suffixes to strip when comparing consumer/listener class names */
-const CONSUMER_NOISE_TOKENS = new Set([
-  'listener', 'consumer', 'process', 'processor', 'handler',
-  'service', 'impl', 'mafka', 'mq', 'kafka', 'abstract', 'base',
-]);
-
-/**
- * Fuzzy-resolve a Mafka/MQ consumer class when the symbolName (from properties
- * listenerId) doesn't match any node exactly. Searches for Class/Interface nodes
- * in consumer/listener/mq directories and scores by token overlap.
- */
-async function fuzzyResolveConsumerClass(
-  repoId: string,
-  symbolName: string,
-  findHandlerMethodInFile: (cls: { id: string; name: string; type: string; filePath: string }) => Promise<{ id: string; name: string; type: string; filePath: string }>,
-): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  // Tokenize input and remove noise tokens to get core business tokens
-  const inputTokens = tokenizeSymbolName(symbolName);
-  const coreTokens = inputTokens.filter((t) => !CONSUMER_NOISE_TOKENS.has(t));
-  if (coreTokens.length === 0) return null;
-
-  // Search for Class/Interface nodes in consumer/listener/mq directories.
-  // Note: Kùzu doesn't support labels(c)[0] = 'X' in WHERE clause reliably,
-  // so we filter by node ID prefix (which encodes the node type).
-  const candidates = await executeParameterized(
-    repoId,
-    `MATCH (c) WHERE (c.id STARTS WITH 'Class:' OR c.id STARTS WITH 'Interface:')
-     AND (c.filePath CONTAINS 'consumer' OR c.filePath CONTAINS 'Consumer'
-          OR c.filePath CONTAINS 'listener' OR c.filePath CONTAINS 'Listener'
-          OR c.filePath CONTAINS '/mq/' OR c.filePath CONTAINS 'mafka'
-          OR c.filePath CONTAINS 'Mafka')
-     AND NOT c.filePath CONTAINS 'test/'
-     AND NOT c.filePath CONTAINS 'Test'
-     AND NOT c.filePath CONTAINS '/model/'
-     AND NOT c.filePath CONTAINS '/dto/'
-     AND NOT c.filePath CONTAINS '/entity/'
-     AND NOT c.filePath CONTAINS '/vo/'
-     AND NOT c.filePath CONTAINS '/pojo/'
-     RETURN c.id AS id, c.name AS name, c.filePath AS filePath`,
-    {},
-  );
-
-  if (candidates.length === 0) return null;
-
-  // Class name suffixes/substrings that indicate non-consumer classes
-  const NON_CONSUMER_SUFFIXES = ['Model', 'Dto', 'DTO', 'VO', 'Entity', 'Request', 'Response', 'Result', 'Param', 'Config', 'Message'];
-  // Class name substrings that indicate producers (not consumers)
-  const PRODUCER_INDICATORS = ['Producer', 'Sender', 'Publisher'];
-
-  // Score each candidate by token overlap with core tokens
-  let bestScore = 0;
-  let bestCandidate: { id: string; name: string; type: string; filePath: string } | null = null;
-
-  for (const row of candidates) {
-    const candidateName = (row.name ?? row[1]) as string;
-
-    // Skip classes whose name ends with a non-consumer suffix or contains producer indicators
-    if (NON_CONSUMER_SUFFIXES.some((suffix) => candidateName.endsWith(suffix))) continue;
-    if (PRODUCER_INDICATORS.some((ind) => candidateName.includes(ind))) continue;
-
-    const candidateTokens = tokenizeSymbolName(candidateName)
-      .filter((t) => !CONSUMER_NOISE_TOKENS.has(t));
-
-    // Count matching core tokens (case-insensitive)
-    let matchCount = 0;
-    for (const ct of coreTokens) {
-      if (candidateTokens.includes(ct)) matchCount++;
-    }
-
-    // Score = matched / max(inputCore, candidateCore) to normalize
-    const score = matchCount / Math.max(coreTokens.length, candidateTokens.length || 1);
-
-    const nodeId = (row.id ?? row[0]) as string;
-    const isClass = nodeId.startsWith('Class:');
-
-    // Prefer higher score; on tie, prefer Impl class over Interface/abstract
-    const isImpl = isClass && (candidateName.endsWith('Impl') || candidateName.includes('Impl'));
-    const bestIsInterface = bestCandidate?.type === 'Interface' || (bestCandidate && !bestCandidate.name.includes('Impl'));
-    if (score > bestScore || (score === bestScore && isImpl && bestIsInterface)) {
-      bestScore = score;
-      bestCandidate = {
-        id: nodeId,
-        name: candidateName,
-        type: isClass ? 'Class' : 'Interface',
-        filePath: (row.filePath ?? row[2]) as string,
-      };
-    }
-  }
-
-  // Require at least 40% token overlap to avoid false positives.
-  // Exception: if there's only ONE viable consumer class in the repo,
-  // use it as fallback (high confidence when the repo has a single consumer).
-  if (!bestCandidate || bestScore < 0.4) {
-    // Count viable candidates (those that passed suffix + producer filter)
-    const viableCandidates = candidates.filter((row) => {
-      const name = (row.name ?? row[1]) as string;
-      if (NON_CONSUMER_SUFFIXES.some((suffix) => name.endsWith(suffix))) return false;
-      if (PRODUCER_INDICATORS.some((ind) => name.includes(ind))) return false;
-      return true;
-    });
-    if (viableCandidates.length === 1) {
-      const sole = viableCandidates[0];
-      const soleId = (sole.id ?? sole[0]) as string;
-      const soleName = (sole.name ?? sole[1]) as string;
-      const soleCandidate = {
-        id: soleId,
-        name: soleName,
-        type: soleId.startsWith('Class:') ? 'Class' : 'Interface',
-        filePath: (sole.filePath ?? sole[2]) as string,
-      };
-      logger.info(
-        `[trace] fuzzyResolveConsumerClass: "${symbolName}" → "${soleName}" ` +
-        `(sole-consumer fallback, coreTokens=[${coreTokens.join(',')}])`,
-      );
-      return findHandlerMethodInFile(soleCandidate);
-    }
-
-    logger.info(
-      `[trace] fuzzyResolveConsumerClass: no match for "${symbolName}" (best score=${bestScore.toFixed(2)}, ` +
-      `coreTokens=[${coreTokens.join(',')}], viable=${viableCandidates.length}, candidates=${candidates.length})`,
-    );
-    return null;
-  }
-
-  logger.info(
-    `[trace] fuzzyResolveConsumerClass: "${symbolName}" → "${bestCandidate.name}" ` +
-    `(score=${bestScore.toFixed(2)}, coreTokens=[${coreTokens.join(',')}])`,
-  );
-
-  // Drill down to handler method for BFS
-  return findHandlerMethodInFile(bestCandidate);
-}
-
-/**
- * Check if a file path belongs to a client/IDL/thrift-common module (not a server implementation).
- * These modules contain interface definitions that are dead-ends for BFS (no CALLS edges).
- */
-function isClientModulePath(filePath: string): boolean {
-  if (!filePath) return false;
-  const fp = filePath.toLowerCase();
-  // Standard client module patterns
-  if (fp.includes('-client/') || fp.includes('-client-') || fp.includes('_client/') ||
-    fp.includes('-thrift-common/') || fp.includes('-thrift-inner/') ||
-    fp.includes('/idl/') || fp.endsWith('.thrift')) return true;
-  // API interface modules (e.g. flight-biz-international-api/)
-  if (/-api\//.test(fp)) return true;
-  // Client modules with version suffix (e.g. flightTracker-client0.8.0/)
-  if (/[_-]client\d/.test(fp)) return true;
-  return false;
-}
-
-/**
- * Fallback resolve: when resolveByName picks a client-module interface definition
- * (dead-end for BFS), search for the server-side implementation class in the same repo.
- *
- * Strategy:
- *   1. Extract the short method name from symbolName (e.g. "checkTransit" from
- *      "TTransitSecondCheckService.checkTransit").
- *   2. Search for Method nodes with that name in server/impl directories
- *      (excluding client/test/thrift-common paths).
- *   3. Score candidates: prefer -server/ paths, Impl classes, ThriftServiceImpl patterns.
- *   4. Return the best candidate, or null if no server-side implementation found.
- */
-async function resolveServerImpl(
-  repoId: string,
-  symbolName: string,
-): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  const lastDot = symbolName.lastIndexOf('.');
-  const shortName = lastDot >= 0 ? symbolName.slice(lastDot + 1) : symbolName;
-  if (!shortName) return null;
-
-  // Search for all Method nodes with the short name, excluding client/test/thrift paths
-  const rows = await executeParameterized(
-    repoId,
-    `MATCH (n) WHERE n.name = $name
-     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
-    { name: shortName },
-  );
-  if (rows.length === 0) return null;
-
-  // Filter out client-module and test candidates
-  const serverCandidates = rows
-    .map((r: Record<string, unknown>) => ({
-      id: (r.id ?? r[0]) as string,
-      name: (r.name ?? r[1]) as string,
-      type: (r.type ?? r[2]) as string,
-      filePath: (r.filePath ?? r[3]) as string,
-    }))
-    .filter((c) => !isClientModulePath(c.filePath) && !isTestFilePath(c.filePath));
-
-  if (serverCandidates.length === 0) return null;
-
-  // Score: prefer -server/ paths, Impl classes, Method nodes
-  const scored = serverCandidates.map((c) => {
-    let score = 0;
-    if (c.filePath.includes('-server/') || c.filePath.includes('-service/') ||
-        c.filePath.includes('_server/') || c.filePath.includes('_service/')) score += 50;
-    if (c.id.startsWith('Method:')) score += 10;
-    if (c.id.toLowerCase().includes('impl')) score += 20;
-    if (c.id.toLowerCase().includes('thriftserver') || c.id.toLowerCase().includes('thriftserviceimpl')) score += 30;
-    return { ...c, score };
-  });
-  scored.sort((a, b) => b.score - a.score);
-
-  const best = scored[0];
-  logger.info(
-    `[trace] resolveServerImpl fallback: "${symbolName}" → "${best.id}" ` +
-    `(score=${best.score}, ${scored.length} server candidates from ${rows.length} total)`,
-  );
-  return best;
-}
-
-/** Resolve a symbol by name in a repo's lbug (for cross-repo entry).
- *
- * symbolName comes from contracts.json `to.symbolRef.name`, typically in
- * "ClassName.methodName" format (e.g. "SecondCheckThriftService.secondCheck").
- *
- * LadybugDB stores `n.name` as just the method name (e.g. "secondCheck"),
- * so the full qualified name will never match directly. When the short-name
- * fallback returns multiple candidates we disambiguate by:
- *   1. Preferring nodes whose id/filePath contains the class-name prefix
- *      (or a common variant like Service→Server, e.g. "SecondCheckThriftServer").
- *   2. Preferring Method nodes over Class/Interface nodes.
- *   3. Excluding test files.
- */
-async function resolveByName(
-  repoId: string,
-  symbolName: string,
-): Promise<{ id: string; name: string; type: string; filePath: string } | null> {
-  // Fast-reject synthetic/non-Java symbol names that will never resolve in lbug
-  if (isUnresolvableSymbolName(symbolName)) {
-    logger.info(`[trace] resolveByName: skipping unresolvable symbol "${symbolName}"`);
-    return null;
-  }
-
-  // Well-known handler method names for Mafka/MQ consumer classes.
-  // When we resolve to a Class node, we prefer BFS from its handler method
-  // (which has CALLS edges) rather than the Class itself (which only has HAS_METHOD edges).
-  const handlerNames = new Set(['handleMessage', 'onRecvMessage', 'consume', 'onMessage', 'process', 'execute', 'run']);
-
-  /**
-   * Given a Class/Interface node, find its best handler Method for BFS seeding.
-   * Returns the Method node if found, otherwise the original class node.
-   */
-  async function findHandlerMethodInFile(
-    cls: { id: string; name: string; type: string; filePath: string },
-  ): Promise<{ id: string; name: string; type: string; filePath: string }> {
-    if (!cls.filePath) return cls;
-    const methods = await executeParameterized(
-      repoId,
-      `MATCH (m:Method) WHERE m.filePath = $fp
-       RETURN m.id AS id, m.name AS name, labels(m)[0] AS type, m.filePath AS filePath`,
-      { fp: cls.filePath },
-    );
-    if (methods.length === 0) return cls;
-    const handler = methods.find((m: Record<string, unknown>) => handlerNames.has((m.name ?? m[1]) as string));
-    const best = handler ?? methods[0];
-    return {
-      id: (best.id ?? best[0]) as string,
-      name: (best.name ?? best[1]) as string,
-      type: (best.type ?? best[2]) as string,
-      filePath: (best.filePath ?? best[3]) as string,
-    };
-  }
-
-  // Try exact name match first (works when lbug stores qualified names)
-  const rows = await executeParameterized(
-    repoId,
-    `MATCH (n) WHERE n.name = $name
-     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-     LIMIT 1`,
-    { name: symbolName },
-  );
-  if (rows.length > 0) {
-    const r = rows[0];
-    const matched = {
-      id: (r.id ?? r[0]) as string,
-      name: (r.name ?? r[1]) as string,
-      type: (r.type ?? r[2]) as string,
-      filePath: (r.filePath ?? r[3]) as string,
-    };
-    // If exact match is a Method node, return directly — it has CALLS edges.
-    // If it's a Class/Interface/Constructor, drill down to its handler method
-    // because BFS only follows CALLS edges (not HAS_METHOD).
-    const nodeId = matched.id;
-    if (nodeId.startsWith('Method:')) {
-      return matched;
-    }
-    // Class/Interface/Constructor — find the handler method in the same file
-    return findHandlerMethodInFile(matched);
-  }
-
-  // Extract class prefix and short method name
-  const lastDot = symbolName.lastIndexOf('.');
-  if (lastDot < 0) {
-    // No dot — treat as a class name. Find the Class node then its handler method.
-    const classRow = await executeParameterized(
-      repoId,
-      `MATCH (c) WHERE c.name = $name
-       RETURN c.id AS id, c.name AS name, labels(c)[0] AS type, c.filePath AS filePath
-       LIMIT 1`,
-      { name: symbolName },
-    );
-    if (classRow.length > 0) {
-      const cls = classRow[0];
-      const clsResult = {
-        id: (cls.id ?? cls[0]) as string,
-        name: (cls.name ?? cls[1]) as string,
-        type: (cls.type ?? cls[2]) as string,
-        filePath: (cls.filePath ?? cls[3]) as string,
-      };
-      return findHandlerMethodInFile(clsResult);
-    }
-
-    // Fuzzy fallback for Mafka/MQ bean names that don't match Java class names.
-    // Strategy: tokenize the symbolName, search for Class nodes in consumer/listener/mq
-    // directories, score by token overlap.
-    const fuzzyResult = await fuzzyResolveConsumerClass(repoId, symbolName, findHandlerMethodInFile);
-    if (fuzzyResult) return fuzzyResult;
-
-    return null;
-  }
-
-  const classPrefix = symbolName.slice(0, lastDot);   // e.g. "SecondCheckThriftService"
-  const shortName = symbolName.slice(lastDot + 1);     // e.g. "secondCheck"
-
-  // Fetch ALL candidates with the short name (no LIMIT 1)
-  const rows2 = await executeParameterized(
-    repoId,
-    `MATCH (n) WHERE n.name = $name
-     RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath`,
-    { name: shortName },
-  );
-  if (rows2.length === 0) return null;
-
-  const candidates: SymbolCandidate[] = rows2.map((r: Record<string, unknown>) => ({
-    id: (r.id ?? r[0]) as string,
-    name: (r.name ?? r[1]) as string,
-    type: (r.type ?? r[2]) as string,
-    filePath: (r.filePath ?? r[3]) as string,
-  }));
-
-  // Build class-name variants for fuzzy matching:
-  // "SecondCheckThriftService" → also try "SecondCheckThriftServer", "SecondCheckThrift"
-  const classVariants = [classPrefix];
-  if (classPrefix.endsWith('Service')) {
-    classVariants.push(classPrefix.replace(/Service$/, 'Server'));
-    classVariants.push(classPrefix.replace(/Service$/, 'Impl'));
-    classVariants.push(classPrefix.replace(/Service$/, ''));
-  } else if (classPrefix.endsWith('Server')) {
-    classVariants.push(classPrefix.replace(/Server$/, 'Service'));
-    classVariants.push(classPrefix.replace(/Server$/, 'Impl'));
-    classVariants.push(classPrefix.replace(/Server$/, ''));
-  } else if (classPrefix.endsWith('Impl')) {
-    classVariants.push(classPrefix.replace(/Impl$/, 'Service'));
-    classVariants.push(classPrefix.replace(/Impl$/, 'Server'));
-    classVariants.push(classPrefix.replace(/Impl$/, ''));
-  }
-
-  candidates.sort((a, b) => scoreCandidate(b, classVariants) - scoreCandidate(a, classVariants));
-
-  const best = candidates[0];
-  if (candidates.length > 1) {
-    logger.info(
-      `[trace] resolveByName "${symbolName}": ${candidates.length} candidates for short name "${shortName}", ` +
-      `selected "${best.id}" (score=${scoreCandidate(best, classVariants)}) over ${candidates.slice(1).map(c => `"${c.id}"(${scoreCandidate(c, classVariants)})`).join(', ')}`,
-    );
-  }
-
-  return best;
-}
-
-/**
  * Run BFS within a single repo's lbug graph.
- * Returns visited nodes (and all visited file paths including seeds).
+ * Seeds are included in nodes at depth=0. Returns visited nodes and file paths.
  */
 async function intraRepoBFS(
   repoId: string,
-  seedIds: string[],
-  seedFilePaths: string[],
+  seeds: ResolvedSymbol[],
   direction: 'downstream' | 'upstream',
   opts: {
     maxDepth: number;
@@ -893,10 +294,11 @@ async function intraRepoBFS(
   const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
   const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
-  const visited = new Set<string>(seedIds);
-  const visitedFilePaths = new Set<string>(seedFilePaths);
-  let frontier = [...seedIds];
-  const nodes: TraceNode[] = [];
+  const visited = new Set<string>(seeds.map((s) => s.id));
+  const visitedFilePaths = new Set<string>(seeds.filter((s) => s.filePath).map((s) => s.filePath));
+  let frontier = seeds.map((s) => s.id);
+  // Include seed nodes themselves at depth=0
+  const nodes: TraceNode[] = seeds.map((s) => ({ ...s, depth: 0 }));
 
   for (let depth = 1; (maxDepth === 0 || depth <= maxDepth) && frontier.length > 0; depth++) {
     // Use parameterized query to avoid isWriteQuery false positives when
@@ -1049,8 +451,8 @@ function findCrossRepoHopsFromRegistry(
       contractType: link.type,
       matchType: link.matchType,
       linkConfidence: link.confidence,
-      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name },
-      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name },
+      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name, symbolFilePath: link.from.symbolRef.filePath },
+      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name, symbolFilePath: link.to.symbolRef.filePath },
     });
   }
 
@@ -1069,8 +471,8 @@ function findCrossRepoHopsFromRegistry(
       contractType: link.type,
       matchType: link.matchType,
       linkConfidence: link.confidence,
-      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name },
-      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name },
+      from: { repo: link.from.repo, symbolUid: link.from.symbolUid, symbolName: link.from.symbolRef.name, symbolFilePath: link.from.symbolRef.filePath },
+      to: { repo: link.to.repo, symbolUid: link.to.symbolUid, symbolName: link.to.symbolRef.name, symbolFilePath: link.to.symbolRef.filePath },
     });
   }
 
@@ -1081,7 +483,7 @@ function findCrossRepoHopsFromRegistry(
 // Segment processing (extracted for parallel execution)
 // ---------------------------------------------------------------------------
 
-type QueueItem = { repoPath: string; symbolName: string; crossDepth: number; isTopic?: boolean };
+type QueueItem = { repoPath: string; symbolName: string; crossDepth: number; isTopic?: boolean; hintFilePath?: string };
 
 interface SegmentResult {
   repoPath: string;
@@ -1104,7 +506,8 @@ async function processOneSegment(
   relationTypes: string[],
   includeTests: boolean,
   minConfidence: number,
-  openedRepoIds: string[],
+  openedRepoIds: Set<string>,
+  resolver: SymbolResolver,
 ): Promise<SegmentResult> {
   const regName = config.repos[item.repoPath];
   if (!regName) {
@@ -1122,104 +525,51 @@ async function processOneSegment(
   const dbPath = `${repoHandle.storagePath}/lbug`;
   try {
     await initLbug(repoHandle.id, dbPath);
-    if (!openedRepoIds.includes(repoHandle.id)) {
-      openedRepoIds.push(repoHandle.id);
-    }
+    openedRepoIds.add(repoHandle.id);
   } catch {
     return { repoPath: item.repoPath, skipped: true };
   }
 
   try {
-    // Resolve the target symbol by name in this repo's lbug.
-    // For topic/MQ hops, symbolName is "mafkaConsumer(...)" or "mafkaProducer(...)"
-    // which won't exist in LadybugDB (it stores Java symbols). In that case we
-    // skip resolveByName and still add the repo as a segment (with empty nodes)
-    // so we can discover further crossHops from this repo.
+    const bfsOpts = { maxDepth, relationTypes, includeTests, minConfidence };
     let nodes: TraceNode[] = [];
     let visitedFilePaths: Set<string> = new Set();
-    let entrySymbolUid = item.symbolName; // fallback for topic hops
+    let entrySymbolUid = item.symbolName;
 
-    if (item.isTopic && !isUnresolvableSymbolName(item.symbolName)) {
-      // Topic hop WITH a real method/class name (from enriched TopicExtractor).
-      // Attempt to resolve and BFS like a normal RPC hop. If resolution fails,
-      // fall back to the empty-segment behaviour (still discover crossHops).
-      const targetSym = await resolveByName(repoHandle.id, item.symbolName);
+    const isUnresolvable = resolver.isUnresolvableSymbolName?.bind(resolver) ?? (() => false);
+    const resolveCtx = { hintFilePath: item.hintFilePath, isTopic: item.isTopic };
+
+    if (item.isTopic && !isUnresolvable(item.symbolName)) {
+      // Topic hop with resolvable symbolName — attempt BFS, fall back to empty segment.
+      const targetSym = resolver.resolveSymbolByName
+        ? await resolver.resolveSymbolByName(repoHandle.id, item.symbolName, resolveCtx)
+        : null;
       if (targetSym) {
-        logger.info(
-          `[trace] topic hop resolved "${item.symbolName}" in "${item.repoPath}" → BFS from ${targetSym.id}`,
-        );
+        logger.info(`[trace] topic hop resolved "${item.symbolName}" → BFS from ${targetSym.id}`);
         entrySymbolUid = targetSym.id;
-        const bfsResult = await intraRepoBFS(
-          repoHandle.id,
-          [targetSym.id],
-          targetSym.filePath ? [targetSym.filePath] : [],
-          direction,
-          { maxDepth, relationTypes, includeTests, minConfidence },
-        );
+        const bfsResult = await intraRepoBFS(repoHandle.id, [targetSym], direction, bfsOpts);
         nodes = bfsResult.nodes;
         visitedFilePaths = bfsResult.visitedFilePaths;
       } else {
-        logger.info(
-          `[trace] topic hop to repo "${item.repoPath}" — "${item.symbolName}" not found in lbug, empty segment`,
-        );
+        logger.info(`[trace] topic hop to "${item.repoPath}" — "${item.symbolName}" not found, empty segment`);
+        if (item.hintFilePath) visitedFilePaths.add(item.hintFilePath);
       }
     } else if (item.isTopic) {
-      // Topic hop with unresolvable symbol name (e.g. "mafkaConsumer(topicName)")
-      // — no BFS possible, but still discover crossHops at repo level
-      logger.info(
-        `[trace] topic hop to repo "${item.repoPath}" — skipping resolveByName for "${item.symbolName}"`,
-      );
+      // Unresolvable topic symbolName — seed visitedFilePaths so RPC out-links are discoverable.
+      logger.info(`[trace] topic hop to "${item.repoPath}" — skipping resolve for "${item.symbolName}"`);
+      if (item.hintFilePath) visitedFilePaths.add(item.hintFilePath);
     } else {
-      let targetSym = await resolveByName(repoHandle.id, item.symbolName);
+      const targetSym = resolver.resolveSymbolByName
+        ? await resolver.resolveSymbolByName(repoHandle.id, item.symbolName, resolveCtx)
+        : null;
       if (!targetSym) {
-        logger.warn(
-          `[trace] symbol "${item.symbolName}" not found in lbug for repo "${item.repoPath}", skipping`,
-        );
+        logger.warn(`[trace] symbol "${item.symbolName}" not found in "${item.repoPath}", skipping`);
         return { repoPath: item.repoPath, skipped: true };
       }
-
       entrySymbolUid = targetSym.id;
-
-      // BFS within this repo
-      const bfsResult = await intraRepoBFS(
-        repoHandle.id,
-        [targetSym.id],
-        targetSym.filePath ? [targetSym.filePath] : [],
-        direction,
-        { maxDepth, relationTypes, includeTests, minConfidence },
-      );
+      const bfsResult = await intraRepoBFS(repoHandle.id, [targetSym], direction, bfsOpts);
       nodes = bfsResult.nodes;
       visitedFilePaths = bfsResult.visitedFilePaths;
-
-      // Fallback: if BFS returned empty nodes and the resolved symbol is in a
-      // client/IDL module (interface definition, no CALLS edges), try to find
-      // the server-side implementation and re-run BFS from there.
-      if (nodes.length === 0 && isClientModulePath(targetSym.filePath)) {
-        logger.info(
-          `[trace] empty BFS from client-module symbol "${targetSym.id}" in "${item.repoPath}", ` +
-          `attempting server-impl fallback for "${item.symbolName}"`,
-        );
-        const serverSym = await resolveServerImpl(repoHandle.id, item.symbolName);
-        if (serverSym) {
-          entrySymbolUid = serverSym.id;
-          const retryBfs = await intraRepoBFS(
-            repoHandle.id,
-            [serverSym.id],
-            serverSym.filePath ? [serverSym.filePath] : [],
-            direction,
-            { maxDepth, relationTypes, includeTests, minConfidence },
-          );
-          nodes = retryBfs.nodes;
-          visitedFilePaths = retryBfs.visitedFilePaths;
-          logger.info(
-            `[trace] server-impl fallback BFS: ${nodes.length} nodes from "${serverSym.id}"`,
-          );
-        } else {
-          logger.info(
-            `[trace] no server-impl found for "${item.symbolName}" in "${item.repoPath}", keeping empty segment`,
-          );
-        }
-      }
     }
 
     // Find cross-repo hops via pre-built index
@@ -1247,19 +597,30 @@ async function processOneSegment(
 }
 
 // ---------------------------------------------------------------------------
-// Main entry point
+// Main entry points
 // ---------------------------------------------------------------------------
 
 /**
- * Run a cross-repo call trace starting from a symbol in one repo,
- * following CALLS edges within each repo and jumping across repos
- * via contracts.json crossLinks.
- *
- * Decoupled from CLI — takes injected deps and returns a structured result.
+ * Run a cross-repo call trace with the default Meituan-specific symbol resolver.
+ * Drop-in replacement — existing callers need no changes.
  */
 export async function runGroupTrace(
   deps: TraceDeps,
   params: TraceParams,
+): Promise<TraceResult | { error: string }> {
+  const { DefaultSymbolResolver } = await import('./trace-resolver.js');
+  return runGroupTraceWithResolver(deps, params, new DefaultSymbolResolver());
+}
+
+/**
+ * Run a cross-repo call trace with a custom SymbolResolver.
+ * Use this to inject a different framework-awareness strategy without
+ * modifying the BFS engine.
+ */
+export async function runGroupTraceWithResolver(
+  deps: TraceDeps,
+  params: TraceParams,
+  resolver: SymbolResolver,
 ): Promise<TraceResult | { error: string }> {
   const {
     name,
@@ -1323,27 +684,24 @@ export async function runGroupTrace(
   const queue: QueueItem[] = [];
 
   // Track all opened repos for cleanup at end of trace
-  const openedRepoIds: string[] = [];
+  const openedRepoIds = new Set<string>();
 
   try {
   // --- Phase 1: entry repo ---
   const entryDbPath = `${entryRepo.storagePath}/lbug`;
   await initLbug(entryRepo.id, entryDbPath);
-  openedRepoIds.push(entryRepo.id);
+  openedRepoIds.add(entryRepo.id);
 
   // Resolve entry symbols (multi-seed: all viable implementations)
-  const entrySyms = await resolveEntrySymbols(entryRepo.id, target);
+  const entrySyms = await resolveEntrySymbols(entryRepo.id, target, resolver);
   if (entrySyms.length === 0) {
     return { error: `Symbol "${target}" not found in repo "${entryRepoPath}".` };
   }
 
   // BFS within entry repo — seed from ALL resolved entry symbols
-  const seedIds = entrySyms.map((s) => s.id);
-  const seedFilePaths = entrySyms.filter((s) => s.filePath).map((s) => s.filePath);
   const bfsResult = await intraRepoBFS(
     entryRepo.id,
-    seedIds,
-    seedFilePaths,
+    entrySyms,
     direction,
     { maxDepth, relationTypes, includeTests, minConfidence },
   );
@@ -1370,7 +728,7 @@ export async function runGroupTrace(
       ? (direction === 'downstream' ? hop.from : hop.to)
       : (direction === 'downstream' ? hop.to : hop.from);
     const key = isTopic
-      ? `topic::${targetEndpoint.repo}`
+      ? `topic::${hop.contractId}::${targetEndpoint.repo}`
       : `${targetEndpoint.repo}::${targetEndpoint.symbolName}`;
     if (!visitedRepos.has(key)) {
       visitedRepos.add(key);
@@ -1379,6 +737,7 @@ export async function runGroupTrace(
         symbolName: targetEndpoint.symbolName,
         crossDepth: 1,
         isTopic,
+        hintFilePath: targetEndpoint.symbolFilePath,
       });
     }
   }
@@ -1430,7 +789,7 @@ export async function runGroupTrace(
             results.push(await processOneSegment(
               item, config, deps, crossLinksIndex, direction,
               maxDepth, relationTypes, includeTests, minConfidence,
-              openedRepoIds,
+              openedRepoIds, resolver,
             ));
           }
           return results;
@@ -1454,7 +813,7 @@ export async function runGroupTrace(
               ? (direction === 'downstream' ? hop.from : hop.to)
               : (direction === 'downstream' ? hop.to : hop.from);
             const key = isTopicHop
-              ? `topic::${nextEndpoint.repo}`
+              ? `topic::${hop.contractId}::${nextEndpoint.repo}`
               : `${nextEndpoint.repo}::${nextEndpoint.symbolName}`;
             if (!visitedRepos.has(key)) {
               visitedRepos.add(key);
@@ -1463,6 +822,7 @@ export async function runGroupTrace(
                 symbolName: nextEndpoint.symbolName,
                 crossDepth: currentDepth + 1,
                 isTopic: isTopicHop,
+                hintFilePath: nextEndpoint.symbolFilePath,
               });
             }
           }

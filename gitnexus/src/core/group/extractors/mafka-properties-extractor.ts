@@ -49,7 +49,7 @@ function escapeRegex(s: string): string {
 async function resolveClassNameFromBeanId(
   repoPath: string,
   beanId: string,
-): Promise<string | null> {
+): Promise<{ className: string; filePath: string } | null> {
   // Only scan likely consumer/listener directories for performance
   const javaFiles = await glob('**/src/main/java/**/*.java', {
     cwd: repoPath,
@@ -71,7 +71,7 @@ async function resolveClassNameFromBeanId(
     }
     if (annotationRe.test(content)) {
       const m = classRe.exec(content);
-      if (m) return m[1];
+      if (m) return { className: m[1], filePath: rel.replace(/\\/g, '/') };
     }
   }
   return null;
@@ -183,16 +183,22 @@ export class MafkaPropertiesExtractor implements ContractExtractor {
         // annotations (handles bean name ≠ class name cases), then fall back
         // to capitalizeFirst(listenerId), then to synthetic format.
         let symbolName: string;
+        let contractFilePath = rel;
         if (entry.listenerId && entry.role === 'consumer') {
-          const resolvedClass = await resolveClassNameFromBeanId(repoPath, entry.listenerId);
-          symbolName = resolvedClass ?? capitalizeFirst(entry.listenerId);
+          const resolved = await resolveClassNameFromBeanId(repoPath, entry.listenerId);
+          if (resolved) {
+            symbolName = resolved.className;
+            contractFilePath = resolved.filePath;
+          } else {
+            symbolName = capitalizeFirst(entry.listenerId);
+          }
         } else if (entry.role === 'provider') {
           symbolName = `mafkaProducer(${entry.topicName})`;
         } else {
           symbolName = `mafkaConsumer(${entry.topicName})`;
         }
 
-        out.push(makeContract(entry.topicName, entry.role, rel, symbolName));
+        out.push(makeContract(entry.topicName, entry.role, contractFilePath, symbolName));
       }
     }
 
