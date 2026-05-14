@@ -366,22 +366,28 @@ export class ThriftExtractor implements ContractExtractor {
       return null;
     }
 
-    // Provider fallback: @ThriftService annotated interfaces have no .thrift IDL,
-    // but are legitimate Thrift service definitions. Accept them with moderate confidence.
+    // Provider fallback: when the Thrift IDL is not in the current repo (e.g. it lives
+    // in an external Maven JAR like eterm-server-thrift-common), the impl class still
+    // declares `implements SomeService.Iface` which the java_thrift_provider scanner
+    // picks up. Accept these as providers with lower confidence so that repos whose
+    // IDL lives in a shared dependency don't lose provider registration.
     if (detection.role === 'provider') {
-      if (detection.source !== 'java_thrift_annotation_provider') {
-        return null;
-      }
+      const source = detection.source === 'java_thrift_annotation_provider'
+        ? detection.source
+        : 'java_thrift_provider_no_idl';
+      const confidence = detection.source === 'java_thrift_annotation_provider'
+        ? detection.confidenceWithoutIdl
+        : Math.min(detection.confidenceWithoutIdl, 0.55); // lower: no IDL to confirm
       return makeContract(
         thriftMethodContractId('', detection.serviceName, detection.methodName),
         detection.role,
         filePath,
         detection.symbolName,
-        detection.confidenceWithoutIdl,
+        confidence,
         {
           service: detection.serviceName,
           method: detection.methodName,
-          source: detection.source,
+          source,
         },
       );
     }
