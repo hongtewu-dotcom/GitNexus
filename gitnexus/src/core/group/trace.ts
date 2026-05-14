@@ -26,6 +26,48 @@ import { getGroupDir, readContractRegistry } from './storage.js';
 import { initLbug, executeParameterized, closeLbug } from '../lbug/pool-adapter.js';
 import { logger } from '../logger.js';
 import type { SymbolResolver, SymbolCandidate, ResolvedSymbol } from './trace-resolver.js';
+import { stat } from 'node:fs/promises';
+import { join } from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Module-level mtime-based caches (invalidated when file changes on disk)
+// ---------------------------------------------------------------------------
+
+interface CacheEntry<T> {
+  value: T;
+  mtime: number;
+}
+
+const _groupConfigCache = new Map<string, CacheEntry<GroupConfig>>();
+const _contractRegistryCache = new Map<string, CacheEntry<Awaited<ReturnType<typeof readContractRegistry>>>>();
+
+async function cachedLoadGroupConfig(groupDir: string): Promise<GroupConfig> {
+  const filePath = join(groupDir, 'group.yaml');
+  try {
+    const { mtimeMs } = await stat(filePath);
+    const cached = _groupConfigCache.get(groupDir);
+    if (cached && cached.mtime === mtimeMs) return cached.value;
+    const value = await loadGroupConfig(groupDir);
+    _groupConfigCache.set(groupDir, { value, mtime: mtimeMs });
+    return value;
+  } catch {
+    return loadGroupConfig(groupDir);
+  }
+}
+
+async function cachedReadContractRegistry(groupDir: string) {
+  const filePath = join(groupDir, 'contracts.json');
+  try {
+    const { mtimeMs } = await stat(filePath);
+    const cached = _contractRegistryCache.get(groupDir);
+    if (cached && cached.mtime === mtimeMs) return cached.value;
+    const value = await readContractRegistry(groupDir);
+    _contractRegistryCache.set(groupDir, { value, mtime: mtimeMs });
+    return value;
+  } catch {
+    return readContractRegistry(groupDir);
+  }
+}
 
 export type { SymbolResolver, SymbolCandidate, ResolvedSymbol } from './trace-resolver.js';
 
@@ -87,6 +129,23 @@ export interface TraceResult {
 }
 
 // ---------------------------------------------------------------------------
+// Internal options (not part of public API)
+// ---------------------------------------------------------------------------
+
+interface SegmentOptions {
+  config: GroupConfig;
+  deps: TraceDeps;
+  crossLinksIndex: CrossLinksIndex;
+  direction: 'downstream' | 'upstream';
+  maxDepth: number;
+  relationTypes: string[];
+  includeTests: boolean;
+  minConfidence: number;
+  openedRepoIds: Set<string>;
+  resolver: SymbolResolver;
+}
+
+// ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
 
@@ -132,7 +191,8 @@ const DEFAULT_RELATION_TYPES = ['CALLS'];
 // Helpers
 // ---------------------------------------------------------------------------
 
-function isTestFilePath(fp: string): boolean {
+/** @internal exported for testing only */
+export function isTestFilePath(fp: string): boolean {
   const lower = fp.toLowerCase();
   return (
     lower.includes('/test/') ||
@@ -148,8 +208,8 @@ function isTestFilePath(fp: string): boolean {
 // Generic candidate helpers (framework-agnostic)
 // ---------------------------------------------------------------------------
 
-/** Detect utility/DTO/enum classes that are poor BFS entry points. */
-function isUtilOrDto(c: SymbolCandidate): boolean {
+/** @internal exported for testing only */
+export function isUtilOrDto(c: SymbolCandidate): boolean {
   const idLower = c.id.toLowerCase();
   const fpLower = (c.filePath || '').toLowerCase();
   const combined = `${idLower}|${fpLower}`;
@@ -161,22 +221,18 @@ function isUtilOrDto(c: SymbolCandidate): boolean {
     /entity[./|]/.test(combined) ||
     /\.set[A-Z]/.test(c.id) ||
     /\.get[A-Z]/.test(c.id) ||
-    /\.is[A-Z]/.test(c.id) ||
-    combined.includes('jsonutils') ||
-    combined.includes('paramvalidate') ||
-    combined.includes('loggerutil') ||
-    combined.includes('logutil');
+    /\.is[A-Z]/.test(c.id);
 }
 
 /**
- * Check if a file path belongs to a client/IDL/thrift-common module.
- * These modules contain interface definitions that are dead-ends for BFS (no CALLS edges).
+ * Check if a file path belongs to a client/IDL module that is a dead-end for BFS
+ * (interface definitions with no CALLS edges).
+ * @internal exported for testing only
  */
-function isClientModulePath(filePath: string): boolean {
+export function isClientModulePath(filePath: string): boolean {
   if (!filePath) return false;
   const fp = filePath.toLowerCase();
   if (fp.includes('-client/') || fp.includes('-client-') || fp.includes('_client/') ||
-    fp.includes('-thrift-common/') || fp.includes('-thrift-inner/') ||
     fp.includes('/idl/') || fp.endsWith('.thrift')) return true;
   if (/-api\//.test(fp)) return true;
   if (/[_-]client\d/.test(fp)) return true;
@@ -357,7 +413,8 @@ async function intraRepoBFS(
  * For each repo, stores the subset of crossLinks where that repo is the
  * "local endpoint" (the side that matches during hop discovery).
  */
-interface CrossLinksIndex {
+/** @internal exported for testing only */
+export interface CrossLinksIndex {
   /** downstream RPC: from.repo → links[] */
   downstreamRpc: Map<string, CrossLink[]>;
   /** upstream RPC: to.repo → links[] */
@@ -368,7 +425,8 @@ interface CrossLinksIndex {
   upstreamTopic: Map<string, CrossLink[]>;
 }
 
-function buildCrossLinksIndex(crossLinks: CrossLink[]): CrossLinksIndex {
+/** @internal exported for testing only */
+export function buildCrossLinksIndex(crossLinks: CrossLink[]): CrossLinksIndex {
   const idx: CrossLinksIndex = {
     downstreamRpc: new Map(),
     upstreamRpc: new Map(),
@@ -417,7 +475,8 @@ function buildCrossLinksIndex(crossLinks: CrossLink[]): CrossLinksIndex {
  * duplicate hops.  We dedup by (contractType, targetRepo) for topics, keeping
  * only the first hop per target repo per topic contractId.
  */
-function findCrossRepoHopsFromRegistry(
+/** @internal exported for testing only */
+export function findCrossRepoHopsFromRegistry(
   crossLinksIndex: CrossLinksIndex,
   repoPath: string,
   visitedFilePaths: Set<string>,
@@ -498,17 +557,10 @@ interface SegmentResult {
  */
 async function processOneSegment(
   item: QueueItem,
-  config: GroupConfig,
-  deps: TraceDeps,
-  crossLinksIndex: CrossLinksIndex,
-  direction: 'downstream' | 'upstream',
-  maxDepth: number,
-  relationTypes: string[],
-  includeTests: boolean,
-  minConfidence: number,
-  openedRepoIds: Set<string>,
-  resolver: SymbolResolver,
+  opts: SegmentOptions,
 ): Promise<SegmentResult> {
+  const { config, deps, crossLinksIndex, direction, maxDepth, relationTypes,
+    includeTests, minConfidence, openedRepoIds, resolver } = opts;
   const regName = config.repos[item.repoPath];
   if (!regName) {
     return { repoPath: item.repoPath, skipped: true };
@@ -608,8 +660,8 @@ export async function runGroupTrace(
   deps: TraceDeps,
   params: TraceParams,
 ): Promise<TraceResult | { error: string }> {
-  const { DefaultSymbolResolver } = await import('./trace-resolver.js');
-  return runGroupTraceWithResolver(deps, params, new DefaultSymbolResolver());
+  const { MeituanSymbolResolver } = await import('./trace-resolver-meituan.js');
+  return runGroupTraceWithResolver(deps, params, new MeituanSymbolResolver());
 }
 
 /**
@@ -641,11 +693,11 @@ export async function runGroupTraceWithResolver(
     return { error: 'direction must be downstream or upstream' };
   }
 
-  // Load group config
+  // Load group config (mtime-cached)
   const groupDir = getGroupDir(deps.gitnexusDir, name);
   let config: GroupConfig;
   try {
-    config = await loadGroupConfig(groupDir);
+    config = await cachedLoadGroupConfig(groupDir);
   } catch (e) {
     if (e instanceof GroupNotFoundError) {
       return { error: `Group "${name}" not found. Run group_list to see configured groups.` };
@@ -653,8 +705,8 @@ export async function runGroupTraceWithResolver(
     return { error: e instanceof Error ? e.message : String(e) };
   }
 
-  // Load contracts.json for cross-repo lookups and build index
-  const registry = await readContractRegistry(groupDir);
+  // Load contracts.json for cross-repo lookups and build index (mtime-cached)
+  const registry = await cachedReadContractRegistry(groupDir);
   const crossLinks = registry?.crossLinks ?? [];
   if (crossLinks.length === 0) {
     logger.warn(`[trace] No crossLinks in contracts.json for group "${name}". Cross-repo hops disabled.`);
@@ -786,11 +838,11 @@ export async function runGroupTraceWithResolver(
           const items = repoGroups.get(repoPath)!;
           const results: SegmentResult[] = [];
           for (const item of items) {
-            results.push(await processOneSegment(
-              item, config, deps, crossLinksIndex, direction,
+            results.push(await processOneSegment(item, {
+              config, deps, crossLinksIndex, direction,
               maxDepth, relationTypes, includeTests, minConfidence,
               openedRepoIds, resolver,
-            ));
+            }));
           }
           return results;
         }),

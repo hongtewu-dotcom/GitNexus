@@ -415,6 +415,7 @@ export function registerGroupCommands(program: Command): void {
           relationTypes,
           includeTests: Boolean(opts.includeTests),
           minConfidence,
+          verbose: true, // CLI always requests full data; summary is built locally
         });
 
         if (raw && typeof raw === 'object' && 'error' in raw) {

@@ -2,9 +2,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { runGroupTrace } from '../../../src/core/group/trace.js';
+import {
+  runGroupTrace,
+  isTestFilePath,
+  isClientModulePath,
+  isUtilOrDto,
+  buildCrossLinksIndex,
+  findCrossRepoHopsFromRegistry,
+  type CrossLinksIndex,
+} from '../../../src/core/group/trace.js';
 import type { TraceResult, TraceDeps } from '../../../src/core/group/trace.js';
 import type { GroupToolPort, GroupRepoHandle } from '../../../src/core/group/service.js';
+import { DefaultSymbolResolver } from '../../../src/core/group/trace-resolver.js';
+import type { SymbolCandidate } from '../../../src/core/group/trace-resolver.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -265,21 +275,24 @@ describe('runGroupTrace', () => {
         '../../../src/core/lbug/pool-adapter.js'
       );
 
-      // Entry repo: resolve entry symbol
+      // Entry repo: resolve entry symbol (exact id match → LIMIT 1 query)
       (executeParameterized as any).mockResolvedValueOnce([
         { id: 'be-sym-1', name: 'callFrontend', type: 'Function', filePath: 'src/client.ts' },
       ]);
 
-      // Entry repo BFS depth 1: no CALLS neighbors (now uses executeParameterized)
+      // Entry repo BFS depth 1: no CALLS neighbors
       (executeParameterized as any).mockResolvedValueOnce([]);
 
-      // Target repo: resolve symbol by name "FrontendService.handleRequest"
-      (executeParameterized as any)
-        .mockResolvedValueOnce([
-          { id: 'fe-sym-1', name: 'handleRequest', type: 'Function', filePath: 'src/api.ts' },
-        ]);
+      // Target repo: DefaultSymbolResolver.resolveSymbolByName:
+      //   1. exact full-name match query (rows) → empty
+      (executeParameterized as any).mockResolvedValueOnce([]);
+      //   2. shortName 'handleRequest' query (rows2) → one hit
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'fe-sym-1', name: 'handleRequest', type: 'Method', filePath: 'src/api.ts' },
+      ]);
+      // drillDownToMethod: fe-sym-1 is already Method: → no extra query
 
-      // Target repo BFS depth 1: one neighbor (now uses executeParameterized)
+      // Target repo BFS depth 1: one neighbor
       (executeParameterized as any).mockResolvedValueOnce([
         {
           sourceId: 'fe-sym-1',
@@ -455,9 +468,13 @@ describe('runGroupTrace', () => {
 
       expect(result).not.toHaveProperty('error');
       const trace = result as TraceResult;
-      // Should be exactly 2 segments: entry + ONE for app/frontend (not two)
-      expect(trace.segments).toHaveLength(2);
-      expect(trace.segments[1].repoPath).toBe('app/frontend');
+      // Two topic crossLinks with different contractIds → two hops, two consumer segments.
+      // Dedup key is topic::contractId::repo, so different contractIds each enqueue once.
+      expect(trace.segments).toHaveLength(3);
+      const frontendSegments = trace.segments.filter((s) => s.repoPath === 'app/frontend');
+      expect(frontendSegments).toHaveLength(2);
+      // Each hop should appear in entry crossHops
+      expect(trace.segments[0].crossHops).toHaveLength(2);
     } finally {
       cleanup();
     }
@@ -556,12 +573,12 @@ describe('runGroupTrace', () => {
         '../../../src/core/lbug/pool-adapter.js'
       );
 
-      // Resolve entry symbol
+      // Resolve entry symbol (exact id match) — id has Method: prefix so drillDown is skipped
       (executeParameterized as any).mockResolvedValueOnce([
-        { id: 'sym-1', name: 'myFunc', type: 'Function', filePath: 'src/main.ts' },
+        { id: 'Method:sym-1', name: 'myFunc', type: 'Method', filePath: 'src/main.ts' },
       ]);
 
-      // BFS returns a test file neighbor (now uses executeParameterized)
+      // BFS depth 1: returns a test-file neighbor
       (executeParameterized as any).mockResolvedValueOnce([
         {
           sourceId: 'sym-1',
@@ -573,6 +590,7 @@ describe('runGroupTrace', () => {
           confidence: 1,
         },
       ]);
+      // BFS depth 2 would not run (test-sym filtered → empty frontier)
 
       const port = makePort();
       const result = await runGroupTrace(makeDeps(port, tmpDir), {
@@ -580,15 +598,230 @@ describe('runGroupTrace', () => {
         repo: 'app/backend',
         target: 'sym-1',
         includeTests: false,
-        maxDepth: 1,
+        maxDepth: 2,
       });
 
       expect(result).not.toHaveProperty('error');
       const trace = result as TraceResult;
-      // Test file should be filtered out
-      expect(trace.segments[0].nodes).toHaveLength(0);
+      // Seed sym-1 (non-test) appears at depth=0; test-file neighbor filtered out.
+      expect(trace.segments[0].nodes).toHaveLength(1);
+      expect(trace.segments[0].nodes[0].id).toBe('Method:sym-1');
+      expect(trace.segments[0].nodes.every((n) => !n.filePath.includes('__tests__'))).toBe(true);
     } finally {
       cleanup();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pure-function unit tests (no lbug, no I/O)
+// ---------------------------------------------------------------------------
+
+describe('isTestFilePath', () => {
+  it.each([
+    ['src/__tests__/foo.ts', true],
+    ['src/foo.test.ts', true],
+    ['src/foo.spec.ts', true],
+    ['src/test/foo.ts', true],
+    ['src/tests/foo.ts', true],
+    ['src/foo_test.ts', true],
+    ['src/main.ts', false],
+    ['src/contest/winner.ts', false],
+    ['src/TestHelper.ts', false],
+  ])('%s → %s', (fp, expected) => {
+    expect(isTestFilePath(fp)).toBe(expected);
+  });
+});
+
+describe('isClientModulePath', () => {
+  it.each([
+    ['', false],
+    ['services/order-service/src/main.ts', false],
+    ['services/order-client/src/api.ts', true],
+    ['services/order-client-v2/src/api.ts', true],
+    ['services/order_client/src/api.ts', true],
+    ['idl/order.thrift', true],
+    ['src/services/order.thrift', true],
+    ['services/order-api/src/routes.ts', true],
+    ['services/order-client3/src/api.ts', true],
+  ])('%s → %s', (fp, expected) => {
+    expect(isClientModulePath(fp)).toBe(expected);
+  });
+});
+
+describe('isUtilOrDto', () => {
+  const c = (id: string, fp = ''): SymbolCandidate => ({ id, name: id, type: 'Class', filePath: fp });
+
+  it('flags util classes', () => {
+    expect(isUtilOrDto(c('utils/StringUtils'))).toBe(true);
+    expect(isUtilOrDto(c('util/DateUtil'))).toBe(true);
+  });
+
+  it('flags enum / dto / entity', () => {
+    expect(isUtilOrDto(c('enum/Status'))).toBe(true);
+    expect(isUtilOrDto(c('dto/OrderDto'))).toBe(true);
+    expect(isUtilOrDto(c('entity/UserEntity'))).toBe(true);
+  });
+
+  it('flags getter / setter / is-check methods', () => {
+    expect(isUtilOrDto(c('Order.getName'))).toBe(true);
+    expect(isUtilOrDto(c('Order.setName'))).toBe(true);
+    expect(isUtilOrDto(c('Order.isActive'))).toBe(true);
+  });
+
+  it('does not flag normal service classes', () => {
+    expect(isUtilOrDto(c('OrderService', 'src/service/OrderService.java'))).toBe(false);
+    expect(isUtilOrDto(c('PaymentHandler', 'src/handler/PaymentHandler.java'))).toBe(false);
+  });
+});
+
+describe('buildCrossLinksIndex', () => {
+  it('indexes RPC links by from.repo (downstream) and to.repo (upstream)', () => {
+    const links: any[] = [
+      {
+        from: { repo: 'svc-a', symbolRef: { filePath: 'a.ts', name: 'foo' }, symbolUid: 'u1' },
+        to:   { repo: 'svc-b', symbolRef: { filePath: 'b.ts', name: 'bar' }, symbolUid: 'u2' },
+        type: 'http', contractId: 'c1', matchType: 'exact', confidence: 1,
+      },
+    ];
+    const idx = buildCrossLinksIndex(links);
+    expect(idx.downstreamRpc.get('svc-a')).toHaveLength(1);
+    expect(idx.upstreamRpc.get('svc-b')).toHaveLength(1);
+    expect(idx.downstreamTopic.size).toBe(0);
+  });
+
+  it('indexes topic links by to.repo (downstream) and from.repo (upstream)', () => {
+    const links: any[] = [
+      {
+        from: { repo: 'consumer', symbolRef: { filePath: 'c.ts', name: 'recv' }, symbolUid: 'u3' },
+        to:   { repo: 'producer', symbolRef: { filePath: 'p.ts', name: 'send' }, symbolUid: 'u4' },
+        type: 'topic', contractId: 'topic::orders', matchType: 'exact', confidence: 1,
+      },
+    ];
+    const idx = buildCrossLinksIndex(links);
+    expect(idx.downstreamTopic.get('producer')).toHaveLength(1);
+    expect(idx.upstreamTopic.get('consumer')).toHaveLength(1);
+    expect(idx.downstreamRpc.size).toBe(0);
+  });
+
+  it('returns empty index for no links', () => {
+    const idx = buildCrossLinksIndex([]);
+    expect(idx.downstreamRpc.size).toBe(0);
+    expect(idx.upstreamRpc.size).toBe(0);
+    expect(idx.downstreamTopic.size).toBe(0);
+    expect(idx.upstreamTopic.size).toBe(0);
+  });
+});
+
+describe('findCrossRepoHopsFromRegistry', () => {
+  function makeIdx(overrides: Partial<CrossLinksIndex> = {}): CrossLinksIndex {
+    return {
+      downstreamRpc: new Map(),
+      upstreamRpc: new Map(),
+      downstreamTopic: new Map(),
+      upstreamTopic: new Map(),
+      ...overrides,
+    };
+  }
+
+  it('returns empty when no links for this repo', () => {
+    const idx = makeIdx();
+    const hops = findCrossRepoHopsFromRegistry(idx, 'svc-a', new Set(['a.ts']), 'downstream');
+    expect(hops).toHaveLength(0);
+  });
+
+  it('returns hop when visited file matches RPC from.symbolRef.filePath (downstream)', () => {
+    const link: any = {
+      from: { repo: 'svc-a', symbolRef: { filePath: 'src/client.ts', name: 'callB' }, symbolUid: 'u1' },
+      to:   { repo: 'svc-b', symbolRef: { filePath: 'src/handler.ts', name: 'handle' }, symbolUid: 'u2' },
+      type: 'http', contractId: 'http::c1', matchType: 'exact', confidence: 0.9,
+    };
+    const idx = makeIdx({ downstreamRpc: new Map([['svc-a', [link]]]) });
+    const visited = new Set(['src/client.ts']);
+    const hops = findCrossRepoHopsFromRegistry(idx, 'svc-a', visited, 'downstream');
+    expect(hops).toHaveLength(1);
+    expect(hops[0].contractId).toBe('http::c1');
+    expect(hops[0].from.repo).toBe('svc-a');
+    expect(hops[0].to.repo).toBe('svc-b');
+  });
+
+  it('skips hop when visited file does NOT match', () => {
+    const link: any = {
+      from: { repo: 'svc-a', symbolRef: { filePath: 'src/client.ts', name: 'callB' }, symbolUid: 'u1' },
+      to:   { repo: 'svc-b', symbolRef: { filePath: 'src/handler.ts', name: 'handle' }, symbolUid: 'u2' },
+      type: 'http', contractId: 'http::c1', matchType: 'exact', confidence: 0.9,
+    };
+    const idx = makeIdx({ downstreamRpc: new Map([['svc-a', [link]]]) });
+    const visited = new Set(['src/other.ts']); // doesn't match
+    const hops = findCrossRepoHopsFromRegistry(idx, 'svc-a', visited, 'downstream');
+    expect(hops).toHaveLength(0);
+  });
+
+  it('deduplicates same contractId+repo combination', () => {
+    const link: any = {
+      from: { repo: 'svc-a', symbolRef: { filePath: 'src/client.ts', name: 'callB' }, symbolUid: 'u1' },
+      to:   { repo: 'svc-b', symbolRef: { filePath: 'src/handler.ts', name: 'handle' }, symbolUid: 'u2' },
+      type: 'http', contractId: 'http::c1', matchType: 'exact', confidence: 0.9,
+    };
+    // Same link duplicated in index
+    const idx = makeIdx({ downstreamRpc: new Map([['svc-a', [link, link]]]) });
+    const visited = new Set(['src/client.ts']);
+    const hops = findCrossRepoHopsFromRegistry(idx, 'svc-a', visited, 'downstream');
+    expect(hops).toHaveLength(1);
+  });
+
+  it('skips self-links (remote.repo === currentRepo)', () => {
+    const link: any = {
+      from: { repo: 'svc-a', symbolRef: { filePath: 'src/client.ts', name: 'callSelf' }, symbolUid: 'u1' },
+      to:   { repo: 'svc-a', symbolRef: { filePath: 'src/handler.ts', name: 'handle' }, symbolUid: 'u2' },
+      type: 'http', contractId: 'http::c-self', matchType: 'exact', confidence: 1,
+    };
+    const idx = makeIdx({ downstreamRpc: new Map([['svc-a', [link]]]) });
+    const hops = findCrossRepoHopsFromRegistry(idx, 'svc-a', new Set(['src/client.ts']), 'downstream');
+    expect(hops).toHaveLength(0);
+  });
+});
+
+describe('DefaultSymbolResolver.scoreCandidate', () => {
+  const resolver = new DefaultSymbolResolver();
+  const c = (id: string, fp = '', type = 'Method'): SymbolCandidate => ({ id, name: id, type, filePath: fp });
+
+  it('prefers Method over Class', () => {
+    const method = c('Method:Foo.bar', 'src/Foo.java', 'Method');
+    const cls    = c('Class:Foo',      'src/Foo.java', 'Class');
+    expect(resolver.scoreCandidate(method)).toBeGreaterThan(resolver.scoreCandidate(cls));
+  });
+
+  it('boosts -service/ and -impl/ paths', () => {
+    const impl = c('Class:FooImpl', 'services/order-service/FooImpl.java');
+    const other = c('Class:Foo',    'services/order-common/Foo.java');
+    expect(resolver.scoreCandidate(impl)).toBeGreaterThan(resolver.scoreCandidate(other));
+  });
+
+  it('penalizes -client/ paths', () => {
+    const client = c('Class:FooClient', 'services/order-client/FooClient.java');
+    expect(resolver.scoreCandidate(client)).toBeLessThan(0);
+  });
+
+  it('penalizes util/dto/entity patterns', () => {
+    const util   = c('utils/StringUtils');
+    const dto    = c('dto/OrderDto');
+    const normal = c('Method:OrderService.create', 'src/service/OrderService.java');
+    expect(resolver.scoreCandidate(util)).toBeLessThan(resolver.scoreCandidate(normal));
+    expect(resolver.scoreCandidate(dto)).toBeLessThan(resolver.scoreCandidate(normal));
+  });
+
+  it('boosts classVariant match', () => {
+    const impl = c('Class:OrderServiceImpl', 'src/OrderServiceImpl.java');
+    const other = c('Class:OrderController',  'src/OrderController.java');
+    expect(resolver.scoreCandidate(impl, ['OrderServiceImpl']))
+      .toBeGreaterThan(resolver.scoreCandidate(other, ['OrderServiceImpl']));
+  });
+
+  it('boosts PascalCase target name match', () => {
+    const matching = c('Method:OrderService.create', 'src/OrderService.java');
+    const unrelated = c('Method:PayService.create',  'src/PayService.java');
+    expect(resolver.scoreCandidate(matching, [], 'orderService'))
+      .toBeGreaterThan(resolver.scoreCandidate(unrelated, [], 'orderService'));
   });
 });

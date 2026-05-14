@@ -221,10 +221,16 @@ export interface ExtractedToolDef {
 
 export interface ExtractedORMQuery {
   filePath: string;
-  orm: 'prisma' | 'supabase';
+  orm: 'prisma' | 'supabase' | 'mybatis';
   model: string;
   method: string;
   lineNumber: number;
+  /** For mybatis: the mapper method id (e.g. "selectByPrimaryKey") */
+  mapperId?: string;
+  /** For mybatis: the SQL operation type (select/insert/update/delete) */
+  sqlOp?: 'select' | 'insert' | 'update' | 'delete';
+  /** For mybatis: simple class name from namespace (e.g. "UPayMapper") */
+  mapperClassName?: string;
 }
 
 /** Constructor bindings keyed by filePath for cross-file type resolution */

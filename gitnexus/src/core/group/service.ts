@@ -310,7 +310,45 @@ export class GroupService {
 
   async groupTrace(params: Record<string, unknown>): Promise<unknown> {
     const { runGroupTrace } = await import('./trace.js');
-    return runGroupTrace({ port: this.port, gitnexusDir: getDefaultGitnexusDir() }, params as any);
+    const result = await runGroupTrace({ port: this.port, gitnexusDir: getDefaultGitnexusDir() }, params as any);
+    if ('error' in (result as object)) return result;
+    if (params.verbose) return result;
+
+    // Default: slim response — strip nodes, deduplicate crossHops by contractId.
+    // Avoids returning 40MB+ full trace data over MCP.
+    const full = result as any;
+    const seen = new Set<string>();
+    const dedupHops: unknown[] = [];
+    for (const seg of full.segments ?? []) {
+      for (const hop of seg.crossHops ?? []) {
+        const key = `${hop.from?.repo}\0${hop.to?.repo}\0${hop.contractId}\0${hop.contractType}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          dedupHops.push({
+            contractId: hop.contractId,
+            contractType: hop.contractType,
+            from: { repo: hop.from?.repo, symbolName: hop.from?.symbolName ?? hop.from?.symbolUid ?? '' },
+            to: { repo: hop.to?.repo, symbolName: hop.to?.symbolName ?? hop.to?.symbolUid ?? '' },
+          });
+        }
+      }
+    }
+    return {
+      group: full.group,
+      entryRepo: full.entryRepo,
+      entryTarget: full.entryTarget,
+      direction: full.direction,
+      truncated: full.truncated,
+      skippedRepos: full.skippedRepos,
+      crossHops: dedupHops,
+      stats: {
+        totalRepos: new Set(full.segments?.map((s: any) => s.repoPath) ?? []).size,
+        totalSegments: full.segments?.length ?? 0,
+        totalNodes: full.segments?.reduce((sum: number, s: any) => sum + (s.nodes?.length ?? 0), 0) ?? 0,
+        rawCrossHops: full.segments?.reduce((sum: number, s: any) => sum + (s.crossHops?.length ?? 0), 0) ?? 0,
+        dedupCrossHops: dedupHops.length,
+      },
+    };
   }
 
   async groupContext(params: Record<string, unknown>): Promise<GroupContextResult> {
