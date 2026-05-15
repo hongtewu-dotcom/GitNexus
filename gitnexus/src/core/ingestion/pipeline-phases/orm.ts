@@ -186,6 +186,39 @@ async function extractMybatisQueries(
 // Graph construction (shared for all ORM types)
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a lookup index: "filePath:ClassName.methodName" → Method node ID.
+ * The Java parser appends #<paramCount> to disambiguate overloaded methods
+ * (e.g. "UPayMapper.selectByExampleWithPage#2"). MyBatis XML only knows the
+ * method name, not the param count, so we strip the suffix and keep the first
+ * match. When a mapper interface extends a base class (e.g. MybatisBaseMapper)
+ * the inherited CRUD methods have no Method nodes in that file — those remain
+ * as file-level fallback edges, which is expected.
+ */
+function buildMapperMethodIndex(graph: KnowledgeGraph): {
+  methodIndex: Map<string, string>;
+  filesWithMethods: Set<string>;
+} {
+  const methodIndex = new Map<string, string>();
+  /** Mapper Java files that have at least one Method node in the graph. */
+  const filesWithMethods = new Set<string>();
+  graph.forEachNode((node) => {
+    if (!node.id.startsWith('Method:')) return;
+    const filePath = node.properties.filePath as string | undefined;
+    if (!filePath || !filePath.endsWith('Mapper.java')) return;
+    filesWithMethods.add(filePath);
+    // ID format: "Method:<filePath>:<ClassName>.<methodName>#<paramCount>"
+    // Strip the #N suffix to get a param-count-agnostic key.
+    const idBody = node.id.replace(/^Method:/, '');
+    const hashIdx = idBody.lastIndexOf('#');
+    const withoutSuffix = hashIdx >= 0 ? idBody.slice(0, hashIdx) : idBody;
+    if (!methodIndex.has(withoutSuffix)) {
+      methodIndex.set(withoutSuffix, node.id);
+    }
+  });
+  return { methodIndex, filesWithMethods };
+}
+
 function processORMQueries(
   graph: KnowledgeGraph,
   queries: readonly ExtractedORMQuery[],
@@ -193,6 +226,10 @@ function processORMQueries(
   const modelNodes = new Map<string, string>();
   const seenEdges = new Set<string>();
   let edgesCreated = 0;
+
+  // Pre-build index for fast filePath+methodName → Method node lookup (any #N)
+  const { methodIndex: mapperMethodIndex, filesWithMethods } = buildMapperMethodIndex(graph);
+  let xmlOrphansSkipped = 0;
 
   for (const q of queries) {
     const modelKey = `${q.orm}:${q.model}`;
@@ -222,19 +259,32 @@ function processORMQueries(
     }
 
     // For MyBatis: prefer linking to the specific mapper method node.
-    // The graph stores method IDs as "ClassName.methodName#overloadIndex"
-    // (e.g. "UPayMapper.selectByPrimaryKey#1"). Try candidates with #0 and #1
-    // before falling back to the File node.
+    // Use the pre-built index (filePath:ClassName.methodName → node ID) to
+    // resolve any #<paramCount> suffix without enumerating candidates.
+    //
+    // When method lookup fails there are two distinct cases:
+    //   1. Inherited CRUD methods (e.g. MybatisBaseMapper subclasses) — the
+    //      Java file has NO own Method nodes at all.  Fall back to file-level.
+    //   2. XML-only statements (e.g. selectBySelectiveWithPage) present in the
+    //      XML but absent from the Java interface that otherwise has methods.
+    //      These are orphan/dead SQL — skip them entirely (no edge created).
     let sourceId: string;
     if (q.orm === 'mybatis' && q.mapperId && q.mapperClassName) {
       const qualifiedMethod = `${q.mapperClassName}.${q.mapperId}`;
-      const candidates = [
-        generateId('Method', `${q.filePath}:${qualifiedMethod}#1`),
-        generateId('Method', `${q.filePath}:${qualifiedMethod}#0`),
-        generateId('Method', `${q.filePath}:${qualifiedMethod}`),
-      ];
-      const found = candidates.find((id) => graph.getNode(id));
-      sourceId = found ?? generateId('File', q.filePath);
+      const indexKey = `${q.filePath}:${qualifiedMethod}`;
+      const methodNodeId = mapperMethodIndex.get(indexKey);
+      if (methodNodeId) {
+        sourceId = methodNodeId;
+      } else if (filesWithMethods.has(q.filePath)) {
+        // Java interface was parsed and has other methods, but this specific
+        // statement ID has no matching method → XML-only orphan, skip it.
+        xmlOrphansSkipped++;
+        continue;
+      } else {
+        // Java interface has no Method nodes (e.g. all inherited from base
+        // class) — fall back to file-level edge.
+        sourceId = generateId('File', q.filePath);
+      }
     } else {
       sourceId = generateId('File', q.filePath);
     }
@@ -259,8 +309,9 @@ function processORMQueries(
   }
 
   if (isDev) {
+    const orphanNote = xmlOrphansSkipped > 0 ? `, ${xmlOrphansSkipped} XML orphans skipped` : '';
     logger.info(
-      `ORM dataflow: ${edgesCreated} QUERIES edges, ${modelNodes.size} models (${queries.length} total refs)`,
+      `ORM dataflow: ${edgesCreated} QUERIES edges, ${modelNodes.size} models (${queries.length} total refs${orphanNote})`,
     );
   }
 
