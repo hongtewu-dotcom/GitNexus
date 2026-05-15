@@ -419,17 +419,21 @@ export class GrpcExtractor implements ContractExtractor {
       ignore: sourceIgnoreFilter,
       nodir: true,
     });
-    // Exclude build-tool config files that are never gRPC sources but can
-    // trigger false positives — e.g. webpack plugins whose constructor call
-    // `new UglifyJsPlugin()` looks like a gRPC `loadPackageDefinition` pattern.
-    const filteredSourceFiles = sourceFiles.filter((rel) => {
-      const p = rel.replace(/\\/g, '/');
-      if (/\/webpack\//.test(p)) return false;
-      if (/webpack\.[^/]+\.[cm]?[jt]s$/.test(p)) return false;
-      if (/\.(config|conf)\.[cm]?[jt]s$/.test(p)) return false;
-      if (/(rollup|vite|babel)\.[^/]+\.[cm]?[jt]s$/.test(p)) return false;
-      return true;
-    });
+    // Exclude well-known build-tool config files. These files never contain
+    // gRPC service definitions or client calls, but their plugin instantiation
+    // patterns (e.g. `new UglifyJsPlugin()`) can look like gRPC
+    // `loadPackageDefinition` usage and trigger false-positive contracts.
+    //
+    // The list is intentionally conservative: only files whose *names* are
+    // established conventions for specific build tools are excluded.
+    // Generic names like `grpc.config.ts` or `server.config.ts` are NOT
+    // excluded because they may legitimately contain gRPC client setup.
+    const BUILD_TOOL_CONFIG_RE =
+      /(?:^|\/)(webpack|rollup|vite|esbuild|babel|jest|vitest|postcss|tailwind|next\.config|nuxt\.config|svelte\.config|astro\.config)\.[^/]*\.[cm]?[jt]sx?$/i;
+
+    const filteredSourceFiles = sourceFiles.filter(
+      (rel) => !BUILD_TOOL_CONFIG_RE.test(rel.replace(/\\/g, '/')),
+    );
 
     const parser = new Parser();
     for (const rel of filteredSourceFiles) {
