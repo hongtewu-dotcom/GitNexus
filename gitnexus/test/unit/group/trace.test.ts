@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import {
   runGroupTrace,
+  runGroupTraceWithResolver,
   isTestFilePath,
   isClientModulePath,
   isUtilOrDto,
@@ -113,6 +114,7 @@ vi.mock('../../../src/core/lbug/pool-adapter.js', () => ({
   closeLbug: vi.fn(async () => {}),
   executeParameterized: vi.fn(async () => []),
   executeQuery: vi.fn(async () => []),
+  setMaxPoolSize: vi.fn(() => () => {}), // returns a no-op restore function
 }));
 
 describe('runGroupTrace', () => {
@@ -823,5 +825,175 @@ describe('DefaultSymbolResolver.scoreCandidate', () => {
     const unrelated = c('Method:PayService.create',  'src/PayService.java');
     expect(resolver.scoreCandidate(matching, [], 'orderService'))
       .toBeGreaterThan(resolver.scoreCandidate(unrelated, [], 'orderService'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveCache: same symbol resolved twice in one trace should only call
+// resolver.resolveSymbolByName once
+// ---------------------------------------------------------------------------
+
+describe('resolveCache', () => {
+  it('deduplicates resolveSymbolByName calls for same repoId+symbolName', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      writeContractsJson(groupDir, [
+        {
+          from: {
+            repo: 'app/backend',
+            symbolUid: 'uid-1',
+            symbolRef: { filePath: 'src/client.ts', name: 'FooService.bar' },
+          },
+          to: {
+            repo: 'app/frontend',
+            symbolUid: 'uid-2',
+            symbolRef: { filePath: 'src/handler.ts', name: 'FooService.bar' },
+          },
+          type: 'thrift',
+          contractId: 'thrift::FooService/bar',
+          matchType: 'exact',
+          confidence: 1,
+        },
+        // Second crossLink pointing to the SAME target symbol
+        {
+          from: {
+            repo: 'app/backend',
+            symbolUid: 'uid-3',
+            symbolRef: { filePath: 'src/client2.ts', name: 'FooService.bar' },
+          },
+          to: {
+            repo: 'app/frontend',
+            symbolUid: 'uid-2',
+            symbolRef: { filePath: 'src/handler.ts', name: 'FooService.bar' },
+          },
+          type: 'thrift',
+          contractId: 'thrift::FooService/bar2',
+          matchType: 'exact',
+          confidence: 1,
+        },
+      ]);
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      // Entry repo: resolve entry symbol
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'Method:be-1', name: 'callFoo', type: 'Method', filePath: 'src/client.ts' },
+      ]);
+      // Entry repo BFS: no neighbors (both crossLinks fire from same visited file)
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      // Target repo: resolveSymbolByName — exact match query (should be called ONCE)
+      (executeParameterized as any).mockResolvedValue([
+        { id: 'Method:fe-1', name: 'bar', type: 'Method', filePath: 'src/handler.ts' },
+      ]);
+
+      const resolveCallCount = { n: 0 };
+      const countingResolver = {
+        resolveSymbolByName: async (...args: any[]) => {
+          resolveCallCount.n++;
+          const { DefaultSymbolResolver } = await import('../../../src/core/group/trace-resolver.js');
+          return new DefaultSymbolResolver().resolveSymbolByName(...(args as [any, any, any]));
+        },
+      };
+
+      const port = makePort();
+      await runGroupTraceWithResolver(makeDeps(port, tmpDir), {
+        name: 'g1',
+        repo: 'app/backend',
+        target: 'Method:be-1',
+        maxCrossDepth: 2,
+      }, countingResolver);
+
+      // Two hops point to the same symbolName in the same repo.
+      // resolveCache should deduplicate — resolver called at most once per unique key.
+      expect(resolveCallCount.n).toBeLessThanOrEqual(1);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mtime cache: second trace call with unchanged files returns same result
+// without error (behavioral smoke test — file reads are internal to Node fs)
+// ---------------------------------------------------------------------------
+
+describe('mtime cache', () => {
+  it('returns consistent results on repeated calls with unchanged group files', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      writeContractsJson(groupDir);
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      // Two sequential trace calls need two sets of mocks
+      for (let i = 0; i < 2; i++) {
+        (executeParameterized as any).mockResolvedValueOnce([
+          { id: 'Method:sym-1', name: 'myFunc', type: 'Method', filePath: 'src/main.ts' },
+        ]);
+        (executeParameterized as any).mockResolvedValueOnce([]);
+      }
+
+      const port = makePort();
+      const params = { name: 'g1', repo: 'app/backend', target: 'Method:sym-1' };
+
+      const r1 = await runGroupTrace(makeDeps(port, tmpDir), params) as any;
+      const r2 = await runGroupTrace(makeDeps(port, tmpDir), params) as any;
+
+      // Both calls succeed (no error) and return same structural shape
+      expect(r1.error).toBeUndefined();
+      expect(r2.error).toBeUndefined();
+      expect(r1.group).toBe(r2.group);
+      expect(r1.entryRepo).toBe(r2.entryRepo);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('re-reads contracts.json when file content changes between calls', async () => {
+    const { tmpDir, groupDir, cleanup } = tmpGroup();
+    try {
+      writeContractsJson(groupDir); // initially empty
+
+      const { executeParameterized } = await import(
+        '../../../src/core/lbug/pool-adapter.js'
+      );
+
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'Method:sym-1', name: 'myFunc', type: 'Method', filePath: 'src/main.ts' },
+      ]);
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      const port = makePort();
+      const params = { name: 'g1', repo: 'app/backend', target: 'Method:sym-1' };
+
+      const r1 = await runGroupTrace(makeDeps(port, tmpDir), params) as any;
+      expect(r1.error).toBeUndefined();
+      expect(r1.segments[0].crossHops).toHaveLength(0); // no crossLinks initially
+
+      // Wait 5ms to ensure different mtime, then rewrite with a crossLink
+      await new Promise((r) => setTimeout(r, 10));
+      writeContractsJson(groupDir, [{
+        from: { repo: 'app/backend', symbolUid: 'u1', symbolRef: { filePath: 'src/main.ts', name: 'foo' } },
+        to: { repo: 'app/frontend', symbolUid: 'u2', symbolRef: { filePath: 'src/api.ts', name: 'foo' } },
+        type: 'http', contractId: 'http::c1', matchType: 'exact', confidence: 1,
+      }]);
+
+      (executeParameterized as any).mockResolvedValueOnce([
+        { id: 'Method:sym-1', name: 'myFunc', type: 'Method', filePath: 'src/main.ts' },
+      ]);
+      (executeParameterized as any).mockResolvedValueOnce([]);
+
+      const r2 = await runGroupTrace(makeDeps(port, tmpDir), params) as any;
+      expect(r2.error).toBeUndefined();
+      // After file change, the new crossLink should be picked up
+      expect(r2.segments[0].crossHops).toHaveLength(1);
+    } finally {
+      cleanup();
+    }
   });
 });

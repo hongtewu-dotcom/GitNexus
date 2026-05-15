@@ -1,7 +1,7 @@
 /**
  * Default symbol resolver for cross-repo trace.
  *
- * This module contains framework-aware logic (Thrift / MQ consumer / Crane /
+ * This module contains framework-aware logic (RPC / MQ consumer /
  * service-naming conventions) that would otherwise be hard-coded inside
  * trace.ts.  trace.ts itself remains framework-agnostic: it calls the
  * SymbolResolver interface and knows nothing about concrete framework patterns.
@@ -95,9 +95,10 @@ export interface SymbolResolver {
  * plain `methodName` conventions, and implementation classes live in
  * `-service/` or `-impl/` modules.
  *
- * For framework-specific resolution (e.g. Thrift, MQ consumers, custom
- * service-naming conventions), extend this class and override the methods
- * you need, then pass your resolver to `runGroupTraceWithResolver`.
+ * For framework-specific resolution (e.g. custom RPC frameworks, MQ
+ * consumers, proprietary service-naming conventions), extend this class
+ * and override the methods you need, then pass your resolver to
+ * `runGroupTraceWithResolver`.
  */
 export class DefaultSymbolResolver implements SymbolResolver {
 
@@ -197,7 +198,7 @@ export class DefaultSymbolResolver implements SymbolResolver {
   /**
    * Returns true when a file path belongs to a client/IDL module that should
    * not be used as a BFS seed. Override in subclasses to add framework-specific
-   * patterns (e.g. -thrift-common/, -thrift-inner/).
+   * dead-end patterns (e.g. generated client stubs, IDL output directories).
    */
   protected isClientPath(fp: string): boolean {
     if (!fp) return false;

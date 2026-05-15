@@ -188,6 +188,9 @@ export interface TraceDeps {
 const DEFAULT_MAX_DEPTH = 0; // 0 = unlimited (BFS terminates when frontier is empty)
 const DEFAULT_MAX_CROSS_DEPTH = 10;
 const DEFAULT_RELATION_TYPES = ['CALLS'];
+/** Upper bound for the per-trace lbug pool expansion. Prevents unbounded memory
+ *  growth when a group has hundreds of repos; 64 covers typical large monorepos. */
+const MAX_TRACE_POOL_SIZE = 64;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -752,7 +755,7 @@ export async function runGroupTraceWithResolver(
   // PARALLEL_LIMIT=4 batches × maxCrossDepth layers can open many repos;
   // a small pool causes excessive LRU eviction and lbug reload overhead.
   const repoCount = Object.keys(config.repos).length;
-  const targetPoolSize = Math.min(repoCount + 2, 64);
+  const targetPoolSize = Math.min(repoCount + 2, MAX_TRACE_POOL_SIZE);
   const restorePoolSize = setMaxPoolSize(targetPoolSize);
 
   try {
