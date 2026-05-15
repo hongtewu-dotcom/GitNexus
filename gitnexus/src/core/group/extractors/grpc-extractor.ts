@@ -428,8 +428,13 @@ export class GrpcExtractor implements ContractExtractor {
     // established conventions for specific build tools are excluded.
     // Generic names like `grpc.config.ts` or `server.config.ts` are NOT
     // excluded because they may legitimately contain gRPC client setup.
+    // Matches: webpack.config.js, vite.config.ts, babel.config.mjs,
+    //          next.config.js, jest.config.ts, etc.
+    // Does NOT match: grpc.config.ts, server.config.ts (intentional —
+    //   those may contain legitimate gRPC setup).
+    // Does NOT match: my-webpack-utils.ts (keyword must appear before .config).
     const BUILD_TOOL_CONFIG_RE =
-      /(?:^|\/)(webpack|rollup|vite|esbuild|babel|jest|vitest|postcss|tailwind|next\.config|nuxt\.config|svelte\.config|astro\.config)\.[^/]*\.[cm]?[jt]sx?$/i;
+      /(?:^|\/)(webpack|rollup|vite|esbuild|babel|jest|vitest|postcss|tailwind|next|nuxt|svelte|astro)\.config(\.[^/]+)?\.[cm]?[jt]sx?$/i;
 
     const filteredSourceFiles = sourceFiles.filter(
       (rel) => !BUILD_TOOL_CONFIG_RE.test(rel.replace(/\\/g, '/')),
