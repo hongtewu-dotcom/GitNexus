@@ -283,7 +283,10 @@ export function runExactMatch(
         if (matchingConfig?.cross_repo_only) {
           continue;
         }
-        if (!provider.service || !consumer.service || provider.service === consumer.service) {
+        // Only skip if both have service AND they're equal (intra-service call).
+        // When service is undefined (FE consumers / Shepherd providers), let it through
+        // so cross-repo matches like FE→Shepherd can be established.
+        if (provider.service && consumer.service && provider.service === consumer.service) {
           continue;
         }
       }
@@ -380,7 +383,10 @@ export function runWildcardMatch(
         if (matchingConfig?.cross_repo_only) {
           continue;
         }
-        if (!provider.service || !consumer.service || provider.service === consumer.service) {
+        // Only skip if both have service AND they're equal (intra-service call).
+        // When service is undefined (FE consumers / Shepherd providers), let it through
+        // so cross-repo matches like FE→Shepherd can be established.
+        if (provider.service && consumer.service && provider.service === consumer.service) {
           continue;
         }
       }
