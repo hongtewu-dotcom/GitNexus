@@ -23,7 +23,7 @@ import type {
 import type { GroupRepoHandle, GroupToolPort } from './service.js';
 import { GroupNotFoundError, loadGroupConfig } from './config-parser.js';
 import { getGroupDir, readContractRegistry } from './storage.js';
-import { initLbug, executeParameterized, closeLbug } from '../lbug/pool-adapter.js';
+import { initLbug, executeParameterized, closeLbug, setMaxPoolSize } from '../lbug/pool-adapter.js';
 import { logger } from '../logger.js';
 import type { SymbolResolver, SymbolCandidate, ResolvedSymbol } from './trace-resolver.js';
 import { stat } from 'node:fs/promises';
@@ -143,6 +143,8 @@ interface SegmentOptions {
   minConfidence: number;
   openedRepoIds: Set<string>;
   resolver: SymbolResolver;
+  /** Per-trace resolve cache: "repoId::symbolName::hintFilePath" → result */
+  resolveCache: Map<string, ResolvedSymbol | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +562,7 @@ async function processOneSegment(
   opts: SegmentOptions,
 ): Promise<SegmentResult> {
   const { config, deps, crossLinksIndex, direction, maxDepth, relationTypes,
-    includeTests, minConfidence, openedRepoIds, resolver } = opts;
+    includeTests, minConfidence, openedRepoIds, resolver, resolveCache } = opts;
   const regName = config.repos[item.repoPath];
   if (!regName) {
     return { repoPath: item.repoPath, skipped: true };
@@ -591,11 +593,18 @@ async function processOneSegment(
     const isUnresolvable = resolver.isUnresolvableSymbolName?.bind(resolver) ?? (() => false);
     const resolveCtx = { hintFilePath: item.hintFilePath, isTopic: item.isTopic };
 
+    const cachedResolve = async (repoId: string, symbolName: string): Promise<ResolvedSymbol | null> => {
+      if (!resolver.resolveSymbolByName) return null;
+      const cacheKey = `${repoId}::${symbolName}::${item.hintFilePath ?? ''}`;
+      if (resolveCache.has(cacheKey)) return resolveCache.get(cacheKey)!;
+      const result = await resolver.resolveSymbolByName(repoId, symbolName, resolveCtx);
+      resolveCache.set(cacheKey, result);
+      return result;
+    };
+
     if (item.isTopic && !isUnresolvable(item.symbolName)) {
       // Topic hop with resolvable symbolName — attempt BFS, fall back to empty segment.
-      const targetSym = resolver.resolveSymbolByName
-        ? await resolver.resolveSymbolByName(repoHandle.id, item.symbolName, resolveCtx)
-        : null;
+      const targetSym = await cachedResolve(repoHandle.id, item.symbolName);
       if (targetSym) {
         logger.info(`[trace] topic hop resolved "${item.symbolName}" → BFS from ${targetSym.id}`);
         entrySymbolUid = targetSym.id;
@@ -611,9 +620,7 @@ async function processOneSegment(
       logger.info(`[trace] topic hop to "${item.repoPath}" — skipping resolve for "${item.symbolName}"`);
       if (item.hintFilePath) visitedFilePaths.add(item.hintFilePath);
     } else {
-      const targetSym = resolver.resolveSymbolByName
-        ? await resolver.resolveSymbolByName(repoHandle.id, item.symbolName, resolveCtx)
-        : null;
+      const targetSym = await cachedResolve(repoHandle.id, item.symbolName);
       if (!targetSym) {
         logger.warn(`[trace] symbol "${item.symbolName}" not found in "${item.repoPath}", skipping`);
         return { repoPath: item.repoPath, skipped: true };
@@ -738,6 +745,16 @@ export async function runGroupTraceWithResolver(
   // Track all opened repos for cleanup at end of trace
   const openedRepoIds = new Set<string>();
 
+  // Per-trace resolve cache: avoids redundant lbug queries for the same symbol
+  const resolveCache = new Map<string, ResolvedSymbol | null>();
+
+  // Expand pool to accommodate the full group size during this trace.
+  // PARALLEL_LIMIT=4 batches × maxCrossDepth layers can open many repos;
+  // a small pool causes excessive LRU eviction and lbug reload overhead.
+  const repoCount = Object.keys(config.repos).length;
+  const targetPoolSize = Math.min(repoCount + 2, 64);
+  const restorePoolSize = setMaxPoolSize(targetPoolSize);
+
   try {
   // --- Phase 1: entry repo ---
   const entryDbPath = `${entryRepo.storagePath}/lbug`;
@@ -841,7 +858,7 @@ export async function runGroupTraceWithResolver(
             results.push(await processOneSegment(item, {
               config, deps, crossLinksIndex, direction,
               maxDepth, relationTypes, includeTests, minConfidence,
-              openedRepoIds, resolver,
+              openedRepoIds, resolver, resolveCache,
             }));
           }
           return results;
@@ -884,6 +901,7 @@ export async function runGroupTraceWithResolver(
   }
 
   } finally {
+    restorePoolSize();
     // Close all lbug connections opened during this trace
     for (const rid of openedRepoIds) {
       await closeLbug(rid).catch(() => {});
