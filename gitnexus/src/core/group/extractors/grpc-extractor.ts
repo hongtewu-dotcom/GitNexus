@@ -419,9 +419,20 @@ export class GrpcExtractor implements ContractExtractor {
       ignore: sourceIgnoreFilter,
       nodir: true,
     });
+    // Exclude build-tool config files that are never gRPC sources but can
+    // trigger false positives — e.g. webpack plugins whose constructor call
+    // `new UglifyJsPlugin()` looks like a gRPC `loadPackageDefinition` pattern.
+    const filteredSourceFiles = sourceFiles.filter((rel) => {
+      const p = rel.replace(/\\/g, '/');
+      if (/\/webpack\//.test(p)) return false;
+      if (/webpack\.[^/]+\.[cm]?[jt]s$/.test(p)) return false;
+      if (/\.(config|conf)\.[cm]?[jt]s$/.test(p)) return false;
+      if (/(rollup|vite|babel)\.[^/]+\.[cm]?[jt]s$/.test(p)) return false;
+      return true;
+    });
 
     const parser = new Parser();
-    for (const rel of sourceFiles) {
+    for (const rel of filteredSourceFiles) {
       const plugin = getPluginForFile(rel);
       if (!plugin) continue;
       const content = readSafe(repoPath, rel);
