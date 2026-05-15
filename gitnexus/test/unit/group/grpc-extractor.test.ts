@@ -15,6 +15,7 @@ import {
   buildProtoMap,
   resolveProtoConflict,
   serviceContractId,
+  BUILD_TOOL_CONFIG_RE,
 } from '../../../src/core/group/extractors/grpc-extractor.js';
 import type { ProtoServiceInfo } from '../../../src/core/group/extractors/grpc-extractor.js';
 import type { RepoHandle } from '../../../src/core/group/types.js';
@@ -1118,5 +1119,52 @@ service AuthService {
     );
     expect(protoProvider).toBeDefined();
     expect(protoProvider!.contractId).toBe('grpc::auth.v1.AuthService/Login');
+  });
+});
+
+describe('BUILD_TOOL_CONFIG_RE', () => {
+  it.each([
+    // Standard two-segment names
+    'webpack.config.js',
+    'webpack.config.ts',
+    'vite.config.ts',
+    'vite.config.mjs',
+    'babel.config.js',
+    'babel.config.cjs',
+    'jest.config.ts',
+    'vitest.config.ts',
+    'rollup.config.js',
+    'esbuild.config.ts',
+    'postcss.config.js',
+    'tailwind.config.ts',
+    'next.config.js',
+    'nuxt.config.ts',
+    'svelte.config.js',
+    'astro.config.mjs',
+    // Three-segment names (env suffix)
+    'webpack.config.prod.js',
+    'vite.config.test.ts',
+    // Path-prefixed
+    'src/webpack.config.js',
+    'config/vite.config.ts',
+  ])('matches build-tool config: %s', (path) => {
+    expect(BUILD_TOOL_CONFIG_RE.test(path)).toBe(true);
+  });
+
+  it.each([
+    // Generic config names that may contain gRPC — must NOT be filtered
+    'grpc.config.ts',
+    'server.config.ts',
+    'db.config.js',
+    'app.config.ts',
+    // Utility files that happen to contain the keyword
+    'my-webpack-utils.ts',
+    'vite-plugin-grpc.ts',
+    // Non-config webpack files
+    'webpack.common.js',
+    'webpack.dev.js',
+    'webpack.prod.js',
+  ])('does not match non-config file: %s', (path) => {
+    expect(BUILD_TOOL_CONFIG_RE.test(path)).toBe(false);
   });
 });

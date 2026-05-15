@@ -35,6 +35,20 @@ import {
  *    tree-sitter grammars or query strings — each plugin owns its own.
  */
 
+// ─── Build-tool config file filter ───────────────────────────────────────────
+//
+// Matches well-known build-tool config files by name convention.
+// These files are never gRPC sources but can trigger false-positive contracts
+// when their plugin instantiation patterns look like `loadPackageDefinition`.
+//
+// Only files whose names follow established build-tool conventions are excluded.
+// Generic names like `grpc.config.ts` or `server.config.ts` are intentionally
+// left unfiltered — they may contain legitimate gRPC client setup.
+//
+// @internal exported for testing only
+export const BUILD_TOOL_CONFIG_RE =
+  /(?:^|\/)(webpack|rollup|vite|esbuild|babel|jest|vitest|postcss|tailwind|next|nuxt|svelte|astro)\.config(\.[^/]+)?\.[cm]?[jt]sx?$/i;
+
 // ─── .proto fallback parser (used only when tree-sitter-proto is absent) ───
 
 function contractId(pkg: string, service: string, method: string): string {
@@ -428,14 +442,6 @@ export class GrpcExtractor implements ContractExtractor {
     // established conventions for specific build tools are excluded.
     // Generic names like `grpc.config.ts` or `server.config.ts` are NOT
     // excluded because they may legitimately contain gRPC client setup.
-    // Matches: webpack.config.js, vite.config.ts, babel.config.mjs,
-    //          next.config.js, jest.config.ts, etc.
-    // Does NOT match: grpc.config.ts, server.config.ts (intentional —
-    //   those may contain legitimate gRPC setup).
-    // Does NOT match: my-webpack-utils.ts (keyword must appear before .config).
-    const BUILD_TOOL_CONFIG_RE =
-      /(?:^|\/)(webpack|rollup|vite|esbuild|babel|jest|vitest|postcss|tailwind|next|nuxt|svelte|astro)\.config(\.[^/]+)?\.[cm]?[jt]sx?$/i;
-
     const filteredSourceFiles = sourceFiles.filter(
       (rel) => !BUILD_TOOL_CONFIG_RE.test(rel.replace(/\\/g, '/')),
     );
