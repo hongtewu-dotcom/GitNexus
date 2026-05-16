@@ -19,8 +19,12 @@
  * Authentication: Shepherd API requires SSO cookie. The resolver supports:
  *   1. Cookie passed directly via config (group.yaml `shepherd.cookie`)
  *   2. Cookie file path (group.yaml `shepherd.cookie_file`)
- *   3. Browser-based auto-fetch (catdesk browser-action)
- *   4. Cached response file for offline/CI usage
+ *   3. CatDesk auth exchange (catdesk auth exchange — SSO token via CatPaw Desk)
+ *   4. Browser-based auto-fetch (catdesk browser-action)
+ *   5. Cached response file for offline/CI usage
+ *
+ * Multi-group: The resolver supports fetching routes from multiple Shepherd groups
+ * in a single sync pass, merging contracts from all groups.
  */
 
 import * as fs from 'node:fs/promises';
@@ -61,6 +65,8 @@ export interface ShepherdResolveResult {
   contracts: ExtractedContract[];
   fetchTimeMs: number;
   fromCache: boolean;
+  /** When resolving multiple groups, per-group breakdown */
+  groupResults?: Array<{ group: string; routes: number; contracts: number; fromCache: boolean }>;
 }
 
 // ─── XML Parsing ────────────────────────────────────────────────────
@@ -196,6 +202,25 @@ async function fetchShepherdRoutes(config: ShepherdConfig, groupDir: string): Pr
     }
   }
 
+  // 3.5. Fallback: try catdesk auth exchange (SSO token via CatPaw Desk key)
+  if (!xml || !xml.includes('<apiBriefInfos>')) {
+    try {
+      const exchangedCookie = await fetchCookieViaCatdeskExchange();
+      if (exchangedCookie) {
+        const response = await fetch(url, {
+          headers: { Cookie: exchangedCookie },
+          redirect: 'manual',
+          signal: AbortSignal.timeout(15000),
+        });
+        if (response.ok) {
+          xml = await response.text();
+        }
+      }
+    } catch (err) {
+      logger.warn(`[shepherd] Catdesk auth exchange failed: ${(err as Error).message}`);
+    }
+  }
+
   // 4. Fallback: try catdesk browser-action (if available)
   if (!xml || !xml.includes('<apiBriefInfos>')) {
     try {
@@ -237,6 +262,33 @@ async function fetchShepherdRoutes(config: ShepherdConfig, groupDir: string): Pr
   }
 
   return { xml, fromCache: false };
+}
+
+/**
+ * Attempt to obtain SSO cookie via catdesk auth exchange.
+ * This uses the CatPaw Desk token-exchange mechanism to get a valid SSO cookie
+ * without requiring an active browser session.
+ */
+async function fetchCookieViaCatdeskExchange(): Promise<string | null> {
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileP = promisify(execFile);
+
+    const { stdout } = await execFileP(
+      'catdesk',
+      ['auth', 'exchange', '--format', 'cookie', '--target', 'shepherd.sankuai.com'],
+      { timeout: 10000 },
+    );
+    const cookie = stdout.trim();
+    if (cookie && cookie.length > 10) {
+      return cookie;
+    }
+    return null;
+  } catch {
+    // catdesk auth exchange not available or failed — graceful degradation
+    return null;
+  }
 }
 
 /**
@@ -395,7 +447,7 @@ function routesToContracts(routes: ShepherdRoute[], shepherdGroup: string): Extr
 // ─── Public API ─────────────────────────────────────────────────────
 
 /**
- * Resolve Shepherd gateway routes and produce provider contracts.
+ * Resolve Shepherd gateway routes and produce provider contracts (single group).
  *
  * @param config - Shepherd configuration from group.yaml
  * @param groupDir - Path to the group directory (~/.gitnexus/groups/<name>/)
@@ -418,4 +470,76 @@ export async function resolveShepherdRoutes(
   );
 
   return { routes, contracts, fetchTimeMs, fromCache };
+}
+
+/**
+ * Resolve Shepherd gateway routes from multiple groups in one pass.
+ * Merges contracts from all groups, deduplicating by contractId.
+ * Groups are processed sequentially (each shares the same auth context).
+ *
+ * @param groups - Array of group names to resolve
+ * @param baseConfig - Base Shepherd config (cookie, cache settings shared across groups)
+ * @param groupDir - Path to the group directory (~/.gitnexus/groups/<name>/)
+ * @returns Merged routes, contracts, timing, and per-group breakdown
+ */
+export async function resolveMultipleShepherdGroups(
+  groups: string[],
+  baseConfig: Omit<ShepherdConfig, 'group'>,
+  groupDir: string,
+): Promise<ShepherdResolveResult> {
+  const start = Date.now();
+  const allRoutes: ShepherdRoute[] = [];
+  const allContracts: ExtractedContract[] = [];
+  const seenContractIds = new Set<string>();
+  const groupResults: Array<{ group: string; routes: number; contracts: number; fromCache: boolean }> = [];
+  let anyFromCache = false;
+
+  for (const group of groups) {
+    try {
+      const config: ShepherdConfig = { ...baseConfig, group };
+      const { xml, fromCache } = await fetchShepherdRoutes(config, groupDir);
+      const routes = parseShepherdXml(xml);
+      const contracts = routesToContracts(routes, group);
+
+      // Deduplicate: same contractId from different groups → keep first
+      const newContracts = contracts.filter((c) => {
+        if (seenContractIds.has(c.contractId)) return false;
+        seenContractIds.add(c.contractId);
+        return true;
+      });
+
+      allRoutes.push(...routes);
+      allContracts.push(...newContracts);
+      if (fromCache) anyFromCache = true;
+
+      groupResults.push({
+        group,
+        routes: routes.length,
+        contracts: newContracts.length,
+        fromCache,
+      });
+
+      logger.info(
+        `[shepherd] Group "${group}": ${routes.length} routes → ${newContracts.length} new contracts${fromCache ? ' (cached)' : ''}`,
+      );
+    } catch (err) {
+      logger.warn(`[shepherd] Group "${group}" failed: ${(err as Error).message}`);
+      groupResults.push({ group, routes: 0, contracts: 0, fromCache: false });
+      // Non-fatal: continue with other groups
+    }
+  }
+
+  const fetchTimeMs = Date.now() - start;
+  logger.info(
+    `[shepherd] Multi-group resolved: ${allRoutes.length} total routes, ` +
+    `${allContracts.length} contracts from ${groups.length} groups in ${fetchTimeMs}ms`,
+  );
+
+  return {
+    routes: allRoutes,
+    contracts: allContracts,
+    fetchTimeMs,
+    fromCache: anyFromCache,
+    groupResults,
+  };
 }

@@ -118,13 +118,15 @@ const APPKEY_TO_REPO: Record<string, string> = {
 
 // ============ 数据结构 ============
 interface LotusChainNode {
-  depth: number;
-  appkey: string;
-  priority: string;
-  method: string;
-  type: string;
-  amplification: number;
-  dependency: string;
+depth: number;
+appkey: string;
+priority: string;
+method: string;
+type: string;
+amplification: number;
+dependency: string;
+ignored?: boolean;   // 标记已下线/group 外的节点，diff 时跳过
+ignoreReason?: string;
 }
 
 interface LotusChainFile {
@@ -163,6 +165,15 @@ interface ChainDiffResult {
   coveredMethods: number;      // 被 crossLinks 覆盖的
   missingMethods: MethodCall[];  // 未覆盖的
   coverageRate: number;        // coveredMethods / internalMethods
+  // Mafka Topic 维度
+  totalTopics: number;         // 链路中的 topic 调用数
+  coveredTopics: number;       // 被 crossLinks 覆盖的 topic
+  missingTopics: MethodCall[]; // 未覆盖的 topic
+  topicCoverageRate: number;
+  // RPC/HTTP 维度（排除 topic）
+  totalRpc: number;
+  coveredRpc: number;
+  rpcCoverageRate: number;
 }
 
 // ============ 加载 crossLinks ============
@@ -183,6 +194,10 @@ interface CrossLinkIndex {
   byTargetService: Map<string, CrossLink[]>;
   // key: "targetRepo" → crossLinks[]
   byTargetRepo: Map<string, CrossLink[]>;
+  // key: "topicName" (不含 topic:: 前缀) → crossLinks[]
+  byTopic: Map<string, CrossLink[]>;
+  // key: "repo::topicName" → crossLinks[] (repo 维度的 topic 索引)
+  byRepoTopic: Map<string, CrossLink[]>;
 }
 
 function buildCrossLinkIndex(crossLinks: CrossLink[]): CrossLinkIndex {
@@ -190,6 +205,8 @@ function buildCrossLinkIndex(crossLinks: CrossLink[]): CrossLinkIndex {
     byTargetMethod: new Map(),
     byTargetService: new Map(),
     byTargetRepo: new Map(),
+    byTopic: new Map(),
+    byRepoTopic: new Map(),
   };
 
   for (const cl of crossLinks) {
@@ -241,6 +258,21 @@ function buildCrossLinkIndex(crossLinks: CrossLink[]): CrossLinkIndex {
         mList.push(cl);
         index.byTargetMethod.set(pathKey, mList);
       }
+    } else if (contractId.startsWith('topic::')) {
+      // Mafka Topic crossLink: contractId = "topic::topicName"
+      const topicName = contractId.replace('topic::', '').toLowerCase();
+      // byTopic: 全局 topic 索引
+      const tList = index.byTopic.get(topicName) || [];
+      tList.push(cl);
+      index.byTopic.set(topicName, tList);
+      // byRepoTopic: 按 from repo (consumer) 和 to repo (producer) 都索引
+      for (const repo of [cl.from.repo, cl.to.repo]) {
+        if (!repo) continue;
+        const rtKey = `${repo}::${topicName}`;
+        const rtList = index.byRepoTopic.get(rtKey) || [];
+        rtList.push(cl);
+        index.byRepoTopic.set(rtKey, rtList);
+      }
     }
   }
 
@@ -255,16 +287,24 @@ function extractMethodCalls(chain: LotusChainFile): MethodCall[] {
   for (const node of chain.nodes) {
     if (node.appkey === 'merge.appkey' || !node.appkey || !node.method) continue;
     if (node.method === 'merge.methodName') continue;
+    if (node.ignored) continue;  // 跳过已标记忽略的节点（已下线/group 外）
 
     const key = `${node.appkey}::${node.method}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const repo = APPKEY_TO_REPO[node.appkey] || null;
+    const repo = (node as any).repo || APPKEY_TO_REPO[node.appkey] || null;
 
     let serviceName: string;
     let methodName: string;
-    if (node.type === 'http') {
+    const nodeType = node.type.toLowerCase();
+
+    if (nodeType === 'mafka' || nodeType === 'topic') {
+      // Mafka Topic 节点: method = "topic::topicName"
+      const topicName = node.method.replace(/^topic::/, '');
+      serviceName = topicName;
+      methodName = topicName;
+    } else if (nodeType === 'http') {
       // HTTP 节点 method 是 path 形式（如 /trade/getUnionOrdersV2/insideyear），不含 .
       serviceName = node.method;
       methodName = node.method;
@@ -292,13 +332,41 @@ function extractMethodCalls(chain: LotusChainFile): MethodCall[] {
 function matchMethodCall(call: MethodCall, index: CrossLinkIndex): boolean {
   if (!call.repo) return false;
 
+  const callType = call.type.toLowerCase();
+
+  // Mafka Topic 节点：匹配 topic crossLinks
+  if (callType === 'mafka' || callType === 'topic') {
+    const topicName = call.method.replace(/^topic::/, '').toLowerCase();
+    // 策略1: repo + topic 精确匹配
+    const rtKey = `${call.repo}::${topicName}`;
+    if (index.byRepoTopic.has(rtKey)) return true;
+    // 策略2: 全局 topic 名匹配（topic 可能连接不同 repo）
+    if (index.byTopic.has(topicName)) return true;
+    return false;
+  }
+
   // HTTP 节点：method 是 path，toLowerCase 后与索引的 http path 匹配
-  if (call.type === 'http') {
-    const pathKey = `${call.repo}::${call.method.toLowerCase()}`;
+  if (callType === 'http') {
+    const callPath = call.method.toLowerCase();
+    const pathKey = `${call.repo}::${callPath}`;
     if (index.byTargetMethod.has(pathKey)) return true;
     // 也尝试去掉开头斜杠
-    const pathKeyNoSlash = `${call.repo}::${call.method.toLowerCase().replace(/^\//, '')}`;
+    const pathKeyNoSlash = `${call.repo}::${callPath.replace(/^\//, '')}`;
     if (index.byTargetMethod.has(pathKeyNoSlash)) return true;
+    // Lotus 路径可能带平台/版本后缀（如 /OnewayFlightList/android/{num}/kxmb_mt）
+    // crossLinks 中是基础路径（如 /onewayflightlist），尝试取第一段做前缀匹配
+    const repoPrefix = `${call.repo}::`;
+    for (const key of index.byTargetMethod.keys()) {
+      if (!key.startsWith(repoPrefix)) continue;
+      const indexPath = key.slice(repoPrefix.length);
+      // 检查 Lotus path 是否以 crossLinks path 开头（或去掉斜杠后匹配）
+      const normalizedCallPath = callPath.replace(/^\//, '');
+      const normalizedIndexPath = indexPath.replace(/^\//, '');
+      if (normalizedCallPath.startsWith(normalizedIndexPath + '/') ||
+          normalizedCallPath === normalizedIndexPath) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -345,6 +413,17 @@ function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResul
     }
   }
 
+  // 分离 Topic 和 RPC/HTTP 维度统计
+  const isTopic = (c: MethodCall) => {
+    const t = c.type.toLowerCase();
+    return t === 'mafka' || t === 'topic';
+  };
+  const internalTopics = internalCalls.filter(isTopic);
+  const coveredTopicCalls = coveredCalls.filter(isTopic);
+  const missingTopicCalls = missingCalls.filter(isTopic);
+  const internalRpc = internalCalls.filter(c => !isTopic(c));
+  const coveredRpcCalls = coveredCalls.filter(c => !isTopic(c));
+
   return {
     traceName: chain.traceName,
     logicTraceId: chain.logicTraceId,
@@ -356,6 +435,17 @@ function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResul
     missingMethods: missingCalls,
     coverageRate: internalCalls.length > 0
       ? coveredCalls.length / internalCalls.length
+      : 0,
+    totalTopics: internalTopics.length,
+    coveredTopics: coveredTopicCalls.length,
+    missingTopics: missingTopicCalls,
+    topicCoverageRate: internalTopics.length > 0
+      ? coveredTopicCalls.length / internalTopics.length
+      : 0,
+    totalRpc: internalRpc.length,
+    coveredRpc: coveredRpcCalls.length,
+    rpcCoverageRate: internalRpc.length > 0
+      ? coveredRpcCalls.length / internalRpc.length
       : 0,
   };
 }
@@ -374,44 +464,82 @@ function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFile
   const totalMethods = results.reduce((s, r) => s + r.totalMethods, 0);
   const overallRate = totalInternal > 0 ? (totalCovered / totalInternal * 100).toFixed(1) : '0';
 
+  // Topic 维度汇总
+  const totalTopics = results.reduce((s, r) => s + r.totalTopics, 0);
+  const totalCoveredTopics = results.reduce((s, r) => s + r.coveredTopics, 0);
+  const topicRate = totalTopics > 0 ? (totalCoveredTopics / totalTopics * 100).toFixed(1) : 'N/A';
+  // RPC/HTTP 维度汇总
+  const totalRpc = results.reduce((s, r) => s + r.totalRpc, 0);
+  const totalCoveredRpc = results.reduce((s, r) => s + r.coveredRpc, 0);
+  const rpcRate = totalRpc > 0 ? (totalCoveredRpc / totalRpc * 100).toFixed(1) : 'N/A';
+
   console.log(`\n  📊 Overall Summary:`);
   console.log(`     Chains analyzed:         ${results.length}`);
-  console.log(`     Total unique methods:    ${totalMethods}`);
+  console.log(`     Total unique calls:      ${totalMethods}`);
   console.log(`     Internal (trackable):    ${totalInternal}`);
   console.log(`     External (skip):         ${totalExternal}`);
   console.log(`     Covered by crossLinks:   ${totalCovered}`);
   console.log(`     Missing:                 ${totalInternal - totalCovered}`);
   console.log(`     ────────────────────────────────`);
   console.log(`     Overall Coverage:        ${overallRate}%`);
+  console.log(``);
+  console.log(`     📡 RPC/HTTP Coverage:    ${totalCoveredRpc}/${totalRpc} = ${rpcRate}%`);
+  console.log(`     📨 Mafka Topic Coverage: ${totalCoveredTopics}/${totalTopics} = ${topicRate}%`);
 
   // 每条链路
   console.log('\n  📋 Per-Chain Results:');
   console.log('  ' + '─'.repeat(78));
-  console.log('  ' + 'Trace'.padEnd(28) + 'Internal'.padStart(10) + 'Covered'.padStart(10) + 'Missing'.padStart(10) + 'Rate'.padStart(10));
-  console.log('  ' + '─'.repeat(78));
+  console.log('  ' + 'Trace'.padEnd(28) + 'RPC'.padStart(8) + 'RPC%'.padStart(8) + 'Topic'.padStart(8) + 'Topic%'.padStart(8) + 'Total'.padStart(8) + 'Rate'.padStart(8));
+  console.log('  ' + '─'.repeat(76));
 
   const sorted = [...results].sort((a, b) => a.coverageRate - b.coverageRate);
   for (const r of sorted) {
     const rate = (r.coverageRate * 100).toFixed(1) + '%';
-    const missing = r.internalMethods - r.coveredMethods;
+    const rpcR = r.totalRpc > 0 ? (r.rpcCoverageRate * 100).toFixed(0) + '%' : '-';
+    const topicR = r.totalTopics > 0 ? (r.topicCoverageRate * 100).toFixed(0) + '%' : '-';
+    const rpcStr = r.totalRpc > 0 ? `${r.coveredRpc}/${r.totalRpc}` : '-';
+    const topicStr = r.totalTopics > 0 ? `${r.coveredTopics}/${r.totalTopics}` : '-';
     console.log('  ' +
       r.traceName.padEnd(28) +
-      String(r.internalMethods).padStart(10) +
-      String(r.coveredMethods).padStart(10) +
-      String(missing).padStart(10) +
-      rate.padStart(10)
+      rpcStr.padStart(8) +
+      rpcR.padStart(8) +
+      topicStr.padStart(8) +
+      topicR.padStart(8) +
+      String(r.internalMethods).padStart(8) +
+      rate.padStart(8)
     );
   }
 
   if (summaryOnly) return;
 
-  // 详细缺失分析
-  console.log('\n  ❌ Missing Methods Detail (grouped by repo):');
+  // Mafka Topic 缺失详情
+  const allMissingTopics = results.flatMap(r => r.missingTopics.map(t => ({ ...t, trace: r.traceName })));
+  if (allMissingTopics.length > 0) {
+    const uniqueTopics = [...new Set(allMissingTopics.map(t => t.method))];
+    console.log(`\n  📨 Missing Mafka Topics (${uniqueTopics.length} unique):`);
+    console.log('  ' + '─'.repeat(78));
+    for (const topic of uniqueTopics.slice(0, 20)) {
+      const entries = allMissingTopics.filter(t => t.method === topic);
+      const repos = [...new Set(entries.map(t => t.repo))];
+      const traces = [...new Set(entries.map(t => t.trace))];
+      console.log(`    ${topic}`);
+      console.log(`      repos: ${repos.join(', ')}  |  chains: ${traces.slice(0, 3).join(', ')}${traces.length > 3 ? ` +${traces.length - 3}` : ''}`);
+    }
+    if (uniqueTopics.length > 20) console.log(`    ... and ${uniqueTopics.length - 20} more`);
+  }
+
+  // 详细缺失分析（RPC/HTTP）
+  console.log('\n  ❌ Missing RPC/HTTP Methods Detail (grouped by repo):');
   console.log('  ' + '─'.repeat(78));
 
   const missingByRepo = new Map<string, { trace: string; method: string; appkey: string }[]>();
   for (const r of results) {
-    for (const m of r.missingMethods) {
+    // 只列 RPC/HTTP 缺失（Topic 缺失已单独列出）
+    const rpcMissing = r.missingMethods.filter(m => {
+      const t = m.type.toLowerCase();
+      return t !== 'mafka' && t !== 'topic';
+    });
+    for (const m of rpcMissing) {
       const repo = m.repo || 'unknown';
       const list = missingByRepo.get(repo) || [];
       list.push({ trace: r.traceName, method: m.method, appkey: m.appkey });
@@ -472,21 +600,13 @@ async function main() {
       chainFiles = [path.resolve(args[idx + 1])];
     }
   } else {
-    // 默认: 加载所有 lotus-chain-*.json
+    // 默认: 加载所有 LotusChainFile 格式的 fixture 文件
+    // 排除非链路文件（lotus-flight-full.json 是元数据索引，lotus-traffic-entries.json 是入口列表）
+    const NON_CHAIN_FILES = new Set(['lotus-flight-full.json', 'lotus-traffic-entries.json']);
     const files = fs.readdirSync(FIXTURES_DIR)
-      .filter(f => f.startsWith('lotus-chain-') && f.endsWith('.json'))
+      .filter(f => f.endsWith('.json') && !NON_CHAIN_FILES.has(f))
       .map(f => path.join(FIXTURES_DIR, f));
     chainFiles = files;
-  }
-
-  // 也加载一次/二次验价完整链路
-  const firstCheck = path.join(FIXTURES_DIR, 'lotus-firstcheck-chain.json');
-  const secondCheck = path.join(FIXTURES_DIR, 'lotus-secondcheck-chain.json');
-  if (fs.existsSync(firstCheck) && !chainFiles.includes(firstCheck)) {
-    chainFiles.push(firstCheck);
-  }
-  if (fs.existsSync(secondCheck) && !chainFiles.includes(secondCheck)) {
-    chainFiles.push(secondCheck);
   }
 
   console.log('🔗 Lotus Chain-Level Diff Tool');
@@ -496,7 +616,7 @@ async function main() {
   // 加载 crossLinks
   const crossLinks = loadCrossLinks();
   const index = buildCrossLinkIndex(crossLinks);
-  console.log(`📇 Index: ${index.byTargetMethod.size} target methods, ${index.byTargetService.size} target services, ${index.byTargetRepo.size} target repos`);
+  console.log(`📇 Index: ${index.byTargetMethod.size} target methods, ${index.byTargetService.size} target services, ${index.byTargetRepo.size} target repos, ${index.byTopic.size} topics, ${index.byRepoTopic.size} repo-topic pairs`);
 
   // 比对每条链路
   const results: ChainDiffResult[] = [];
@@ -523,6 +643,26 @@ async function main() {
       overallCoverage: results.reduce((s, r) => s + r.internalMethods, 0) > 0
         ? results.reduce((s, r) => s + r.coveredMethods, 0) / results.reduce((s, r) => s + r.internalMethods, 0)
         : 0,
+      // RPC/HTTP 维度
+      totalRpc: results.reduce((s, r) => s + r.totalRpc, 0),
+      coveredRpc: results.reduce((s, r) => s + r.coveredRpc, 0),
+      rpcCoverageRate: (() => {
+        const t = results.reduce((s, r) => s + r.totalRpc, 0);
+        return t > 0 ? results.reduce((s, r) => s + r.coveredRpc, 0) / t : 0;
+      })(),
+      // Mafka Topic 维度
+      totalTopics: results.reduce((s, r) => s + r.totalTopics, 0),
+      coveredTopics: results.reduce((s, r) => s + r.coveredTopics, 0),
+      topicCoverageRate: (() => {
+        const t = results.reduce((s, r) => s + r.totalTopics, 0);
+        return t > 0 ? results.reduce((s, r) => s + r.coveredTopics, 0) / t : 0;
+      })(),
+      missingTopics: results.flatMap(r => r.missingTopics.map(m => ({
+        chain: r.traceName,
+        appkey: m.appkey,
+        repo: m.repo,
+        topic: m.method,
+      }))),
     },
     chains: results.map(r => ({
       traceName: r.traceName,
@@ -533,11 +673,24 @@ async function main() {
       externalMethods: r.externalMethods,
       coveredMethods: r.coveredMethods,
       coverageRate: r.coverageRate,
+      // RPC/HTTP 维度
+      totalRpc: r.totalRpc,
+      coveredRpc: r.coveredRpc,
+      rpcCoverageRate: r.totalRpc > 0 ? r.coveredRpc / r.totalRpc : 0,
+      // Mafka Topic 维度
+      totalTopics: r.totalTopics,
+      coveredTopics: r.coveredTopics,
+      topicCoverageRate: r.totalTopics > 0 ? r.coveredTopics / r.totalTopics : 0,
       missingMethods: r.missingMethods.map(m => ({
         appkey: m.appkey,
         repo: m.repo,
         method: m.method,
         type: m.type,
+      })),
+      missingTopics: r.missingTopics.map(m => ({
+        appkey: m.appkey,
+        repo: m.repo,
+        topic: m.method,
       })),
     })),
   }, null, 2));

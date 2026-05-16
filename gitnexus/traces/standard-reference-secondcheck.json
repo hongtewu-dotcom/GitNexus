@@ -74,8 +74,11 @@
           {"target": "美团外卖学生认证", "service": "CampusMemberService", "method": "studentValidate", "external": true}
         ],
         "outbound_mq": [
-          {"topic": "booking.order.cancel.delayq", "direction": "send", "description": "延迟取消消息"},
-          {"topic": "flight_order_risk_tag_notify", "direction": "send", "description": "风险标签通知→诸葛系统", "external": true}
+          {"topic": "booking.order.cancel.delayq", "direction": "send", "description": "延迟取消消息（自消费延迟队列）", "noCrossRepo": true},
+          {"topic": "flight_order_risk_tag_notify", "direction": "send", "description": "风险标签通知→诸葛系统", "external": true},
+          {"topic": "flight_waiting_issue_order", "direction": "send", "description": "等待出票通知→flight-order-ticketing"},
+          {"topic": "biz_verification_event_report", "direction": "send", "description": "验价事件上报→flight-biz-verification"},
+          {"topic": "static.data.compare.notify", "direction": "send", "description": "静态数据比对通知→flight-basis-staticdata"}
         ]
       }
     },
@@ -97,7 +100,9 @@
           {"target": "flight-basis-malone", "service": "SiteTravelSkyChannelService", "method": "querySiteTravelSkyStatus"},
           {"target": "flight-booking-support", "service": "DOtaBookingFeedbackThriftService", "method": "owFeedback"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "flight-ota-booking-check-info", "direction": "send", "description": "OTA预订核验信息→flight-basis-fare（运价数据刷新触发）"}
+        ]
       }
     },
     "flight-basis-malone": {
@@ -114,7 +119,9 @@
           {"target": "eTerm(中航信)", "service": "sGuiBookingService", "method": "rtV2", "external": true},
           {"target": "flight-basis-avdc", "service": "AvdcDomService", "method": "queryOwAvCacheData"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "channel_av_info", "direction": "send", "description": "AV渠道信息→flight-basis-avdc消费（SS/RT生编后发送AV渠道数据）"}
+        ]
       }
     },
     "flight-basis-ibeplus": {
@@ -148,11 +155,21 @@
           {"target": "flight-basis-sim", "service": "AirportThriftService", "method": "getAirport"}
         ],
         "outbound_mq": [
-          {"topic": "orderChangeNotify", "direction": "send", "description": "生单成功通知"},
+          {"topic": "orderChangeNotify", "direction": "send", "description": "生单成功通知（→xorder/selftrade/order-search）"},
           {"topic": "need_ticket", "direction": "send", "description": "出票通知"},
-          {"topic": "u_order_notify_status", "direction": "send", "description": "订单状态变更"},
-          {"topic": "u_iorder_notify_status", "direction": "send", "description": "国际订单状态变更"},
+          {"topic": "u_order_notify_status", "direction": "send", "description": "用户订单状态变更（→xorder/ibeplus/order-customer）"},
+          {"topic": "u_iorder_notify_status", "direction": "send", "description": "国际用户订单状态变更（→xorder）"},
+          {"topic": "m_order_notify_status", "direction": "send", "description": "商户订单状态变更（→ticketing/selftrade/selfoperator）"},
+          {"topic": "m_iorder_notify_status", "direction": "send", "description": "国际商户订单状态变更（→ticketing/selfoperator）"},
+          {"topic": "u_ticket_notify_status", "direction": "send", "description": "出票状态变更（→xorder）"},
+          {"topic": "u_order_notify_issued", "direction": "send", "description": "出票成功通知（→ticketing/order-customer/aftersale-express等）"},
+          {"topic": "u.order.business.status.notify", "direction": "send", "description": "业务状态通知（→flight-quote-reaching）"},
+          {"topic": "sign_withhold_order_notify", "direction": "send", "description": "签约预扣通知（→aftersale-express）"},
+          {"topic": "mOrderChange", "direction": "send", "description": "商户单变更（→biz-selftrade）"},
+          {"topic": "mOrderUnissuedRefund", "direction": "send", "description": "商户未出票退款（→biz-selftrade）"},
+          {"topic": "ticket_no_price_update", "direction": "send", "description": "出票无价格更新通知（→aftersale-refundmoney）"},
           {"topic": "u_order_push_travel", "direction": "send", "description": "行程推送→行程中心", "external": true},
+          {"topic": "traffic_order_task_event_topic", "direction": "send", "description": "出行任务事件→酒店侧", "external": true},
           {"topic": "update_order_risk_tag", "direction": "receive", "description": "风险标签更新（来自诸葛系统）", "external": true}
         ]
       }
@@ -174,7 +191,9 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "risk_event_notify", "direction": "send", "description": "风险事件通知（外部风控系统消费）", "external": true}
+        ]
       }
     },
     "flight-biz-selfoperator": {
@@ -187,7 +206,11 @@
           {"target": "flight-biz-flagshipapi", "service": "FlagshipCheckpriceThriftService", "method": "checkPrice"},
           {"target": "flight-biz-flagshipapi", "service": "FlagshipOrderThriftService", "method": "createOrder"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "selfoperator_task_statistic", "direction": "send", "description": "旗舰店任务统计（内部自消费）", "noCrossRepo": true},
+          {"topic": "flight.task.create.task.execute.topic", "direction": "send", "description": "旗舰店任务创建执行（内部自消费）", "noCrossRepo": true},
+          {"topic": "flight.task.check.topic", "direction": "send", "description": "旗舰店任务检查（内部自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "flight-quote-reaching": {
@@ -199,7 +222,9 @@
         "outbound_rpc": [
           {"target": "marketing-agency", "service": "优惠台代理框架", "method": "dispense/use"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "flight_activity_order_refund_notify", "direction": "send", "description": "营销活动退款通知（外部营销系统消费）", "external": true}
+        ]
       }
     },
     "xorder": {
@@ -212,7 +237,11 @@
           {"target": "xproduct", "service": "XProductService", "method": "lock"},
           {"target": "jinchan", "service": "CreatePayTService", "method": "splitAccount"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "xorder.order.status.change", "direction": "send", "description": "X订单状态变更→flight-order-core消费（订单状态同步）"},
+          {"topic": "xorder.xproduct.operate", "direction": "send", "description": "X产品操作通知→xproduct消费（库存扣减/释放）"},
+          {"topic": "xproduct_notify_flight_price_update", "direction": "send", "description": "X产品价格变更通知→flight-order-core/order-customer消费"}
+        ]
       }
     },
     "xproduct": {
@@ -222,7 +251,9 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "flight_xproduct_coupon_change", "direction": "send", "description": "X产品券码变更通知（外部优惠系统消费）", "external": true}
+        ]
       }
     },
     "flight-aftersale-express": {
@@ -236,7 +267,10 @@
           {"target": "flight-basis-sim", "service": "快递订阅", "method": "subscribe"},
           {"target": "jinchan", "service": "支付服务", "method": "createPay"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "express_invoice_notify_status", "direction": "send", "description": "行程单配送状态通知（外部快递系统消费）", "external": true},
+          {"topic": "com.sankuai.flight.aftersale.merchant.notify", "direction": "send", "description": "商户配送通知→flight-biz-selftrade消费"}
+        ]
       }
     },
     "flight-biz-distribution": {
@@ -248,7 +282,10 @@
         "outbound_rpc": [
           {"target": "flight-booking-service", "service": "SecondCheckThriftService", "method": "secondCheck"}
         ],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "distribution.callback.notify", "direction": "send", "description": "分销回调通知（外部分销商消费）", "external": true},
+          {"topic": "distribution.fulfillment.order", "direction": "send", "description": "分销履约订单通知（内部分销流程自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "quote_renderer": {
@@ -280,7 +317,10 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "avdc_update_event", "direction": "send", "description": "AV库存更新事件→flight-basis-fare/staticdata/quote_adapter消费（库存变更通知下游刷新）"},
+          {"topic": "internal_av_invoke_ins_data", "direction": "send", "description": "AV内部调用数据→flight-staticdata-service消费（内部数据同步）"}
+        ]
       }
     },
     "flight-merchant-center": {
@@ -290,7 +330,10 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "merchant.site.alarm", "direction": "send", "description": "站点告警通知（外部运营系统消费）", "external": true},
+          {"topic": "merchant.site.offline", "direction": "send", "description": "站点下线通知（内部配置刷新自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "flight-order-customer": {
@@ -300,7 +343,10 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "orderSmartCardChange", "direction": "send", "description": "智能选座变更通知（内部自消费）", "noCrossRepo": true},
+          {"topic": "flight_elder_guardian_event", "direction": "send", "description": "老人关怀事件→flight-order-core消费"}
+        ]
       }
     },
     "jinchan": {
@@ -323,7 +369,9 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "agency_order_change", "direction": "send", "description": "优惠券代理订单变更（内部自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "benefits-hub": {
@@ -367,7 +415,12 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "shopping_price_change_dispatcher", "direction": "send", "description": "Shopping价格变更分发→quote_renderer/quote_reaching消费"},
+          {"topic": "nfd_task_submit", "direction": "send", "description": "NFD任务提交（内部运价刷新自消费）", "noCrossRepo": true},
+          {"topic": "fd_child_task_dispatcher", "direction": "send", "description": "FD子任务分发（内部运价刷新自消费）", "noCrossRepo": true},
+          {"topic": "shopping_child_task_dispatcher", "direction": "send", "description": "Shopping子任务分发（内部运价刷新自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "flight-basis-ei": {
@@ -377,7 +430,9 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "ei_info_list", "direction": "send", "description": "退改签规则列表→flight-staticdata-service消费（EI数据刷新通知）"}
+        ]
       }
     },
     "flight-biz-flagshipbusiness": {
@@ -387,7 +442,11 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "flagshipban.ban", "direction": "send", "description": "旗舰店生单黑名单通知→flagship_ban系统消费"},
+          {"topic": "biz_verification_event_report", "direction": "send", "description": "验价事件上报→flight-biz-verification消费"},
+          {"topic": "flight.flagship.business.asyncorder", "direction": "send", "description": "旗舰店异步生单（内部自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "flight-biz-flagshipdailishang": {
@@ -417,7 +476,9 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "es_upsert_retry", "direction": "send", "description": "ES写入重试（内部自消费）", "noCrossRepo": true}
+        ]
       }
     },
     "flight-biz-selftrade": {
@@ -427,7 +488,11 @@
       "localRepo": true,
       "interfaces": {
         "outbound_rpc": [],
-        "outbound_mq": []
+        "outbound_mq": [
+          {"topic": "selftrade.ticketapply", "direction": "send", "description": "自营出票申请（内部出票流程自消费）", "noCrossRepo": true},
+          {"topic": "selftrade.reschedule.apply", "direction": "send", "description": "自营改签申请（内部改签流程自消费）", "noCrossRepo": true},
+          {"topic": "selftrade.auto.refund.diff", "direction": "send", "description": "自营退差自动处理（外部结算系统消费）", "external": true}
+        ]
       }
     },
     "flight-biz-merchant": {
@@ -486,7 +551,7 @@
     "local_repo_services": 26,
     "external_services": 10,
     "total_rpc_calls": 87,
-    "total_mq_topics": 9,
+    "total_mq_topics": 55,
     "external_rpc_calls": 15,
     "bfs_unreachable_calls": 1,
     "layers": {

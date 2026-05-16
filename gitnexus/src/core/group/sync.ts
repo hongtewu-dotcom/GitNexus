@@ -16,7 +16,7 @@ import { CraneExtractor } from './extractors/crane-extractor.js';
 import { SquirrelExtractor } from './extractors/squirrel-extractor.js';
 import { ManifestExtractor } from './extractors/manifest-extractor.js';
 import { discoverWorkspaceLinks } from './extractors/workspace-extractor.js';
-import { resolveShepherdRoutes, type ShepherdConfig } from './extractors/shepherd-route-resolver.js';
+import { resolveShepherdRoutes, resolveMultipleShepherdGroups, type ShepherdConfig } from './extractors/shepherd-route-resolver.js';
 import { buildProviderIndex, runExactMatch, runWildcardMatch } from './matching.js';
 import { filterContracts } from './post-filter.js';
 import { detectServiceBoundaries, assignService } from './service-boundary-detector.js';
@@ -91,38 +91,81 @@ function dedupeCrossLinks(links: CrossLink[]): CrossLink[] {
 }
 
 /**
- * Normalize the `detect.shepherd` config value into a ShepherdConfig object.
+ * Resolve the list of shepherd group names from a ShepherdDetectConfig.
+ * Supports:
+ *   - `group: "flight-m"` → single group
+ *   - `group: ["flight-m", "flight-b"]` → multi-group via group field
+ *   - `groups: ["flight-m", "flight-b"]` → multi-group via explicit field (takes precedence)
+ */
+function resolveShepherdGroupNames(raw: ShepherdDetectConfig): string[] {
+  if (raw.groups && raw.groups.length > 0) return raw.groups;
+  if (!raw.group) return [];
+  if (Array.isArray(raw.group)) return raw.group;
+  return [raw.group];
+}
+
+/**
+ * Normalize the `detect.shepherd` config value into shepherd resolution params.
+ * Returns { groups, baseConfig, gatewayRepo } for use with multi-group resolver.
+ *
  * Supports:
  *   - `true` → tries to infer group name from the group config name
- *   - `{ group: 'flight-m', ... }` → uses as-is
+ *   - `{ group: 'flight-m', ... }` → single group
+ *   - `{ group: ['flight-m', 'flight-b'], ... }` → multi-group
+ *   - `{ groups: ['flight-m', 'flight-b'], ... }` → multi-group (explicit)
+ *   - `[{ group: 'flight-m' }, { group: 'flight-b' }]` → array of configs
  */
 function normalizeShepherdConfig(
-  raw: ShepherdDetectConfig | boolean,
+  raw: ShepherdDetectConfig | ShepherdDetectConfig[] | boolean,
   groupConfig: GroupConfig,
-): ShepherdConfig | null {
+): { groups: string[]; baseConfig: Omit<ShepherdConfig, 'group'>; gatewayRepo: string } | null {
   if (raw === false) return null;
+
+  const defaultGatewayRepo = Object.keys(groupConfig.repos).find(
+    (k) => k.includes('gateway') || k.includes('shepherd'),
+  ) || 'api/gateway';
+
   if (raw === true) {
-    // Auto-infer: use group name as shepherd group, try common patterns
-    const name = groupConfig.name;
-    // Look for a repo with 'gateway' in its path
-    const gatewayRepo = Object.keys(groupConfig.repos).find(
-      (k) => k.includes('gateway') || k.includes('shepherd'),
-    );
+    // Auto-infer: use group config name as the single shepherd group
     return {
-      group: name,
-      gateway_repo: gatewayRepo,
+      groups: [groupConfig.name],
+      baseConfig: { gateway_repo: defaultGatewayRepo },
+      gatewayRepo: defaultGatewayRepo,
     };
   }
-  // Object form — pass through with defaults
+
+  // Array of separate configs → merge groups, use first config's auth settings
+  if (Array.isArray(raw)) {
+    const allGroups: string[] = [];
+    for (const item of raw) {
+      allGroups.push(...resolveShepherdGroupNames(item));
+    }
+    const first = raw[0];
+    return {
+      groups: allGroups,
+      baseConfig: {
+        gateway_repo: first.gateway_repo || defaultGatewayRepo,
+        cookie: first.cookie,
+        cookie_file: first.cookie_file,
+        cache_file: first.cache_file,
+        cache_ttl: first.cache_ttl,
+      },
+      gatewayRepo: first.gateway_repo || defaultGatewayRepo,
+    };
+  }
+
+  // Single config object (possibly with multiple groups)
+  const groups = resolveShepherdGroupNames(raw);
   return {
-    group: raw.group,
-    gateway_repo: raw.gateway_repo || Object.keys(groupConfig.repos).find(
-      (k) => k.includes('gateway') || k.includes('shepherd'),
-    ),
-    cookie: raw.cookie,
-    cookie_file: raw.cookie_file,
-    cache_file: raw.cache_file,
-    cache_ttl: raw.cache_ttl,
+    groups,
+    baseConfig: {
+      gateway_repo: raw.gateway_repo || defaultGatewayRepo,
+      cookie: raw.cookie,
+      cookie_file: raw.cookie_file,
+      cache_file: raw.cache_file,
+      cache_ttl: raw.cache_ttl,
+    },
+    gatewayRepo: raw.gateway_repo || defaultGatewayRepo,
   };
 }
 
@@ -322,13 +365,22 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
   // the Shepherd API gateway and register them as provider contracts for the
   // gateway repo. This creates proper frontend→gateway cross-links and helps
   // disambiguate generic paths (e.g. /query) that multiple backends expose.
+  // Supports multiple Shepherd groups (flight-m, flight-b, flight-x, etc.).
   if (config.detect.shepherd) {
     try {
       const shepherdCfg = normalizeShepherdConfig(config.detect.shepherd, config);
       if (shepherdCfg) {
         const groupDir = opts?.groupDir || '';
-        const result = await resolveShepherdRoutes(shepherdCfg, groupDir);
-        const gatewayRepo = shepherdCfg.gateway_repo || 'api/gateway';
+        const { groups, baseConfig, gatewayRepo } = shepherdCfg;
+
+        let result;
+        if (groups.length === 1) {
+          // Single group: use original single-group resolver
+          result = await resolveShepherdRoutes({ ...baseConfig, group: groups[0] }, groupDir);
+        } else {
+          // Multi-group: use merged resolver
+          result = await resolveMultipleShepherdGroups(groups, baseConfig, groupDir);
+        }
 
         for (const c of result.contracts) {
           autoContracts.push({
@@ -338,8 +390,11 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
         }
 
         if (opts?.verbose) {
+          const groupsStr = groups.length === 1
+            ? `group "${groups[0]}"`
+            : `${groups.length} groups [${groups.join(', ')}]`;
           logger.info(
-            `  shepherd: ${result.contracts.length} gateway routes from group "${shepherdCfg.group}"` +
+            `  shepherd: ${result.contracts.length} gateway routes from ${groupsStr}` +
             ` (${result.fetchTimeMs}ms, ${result.fromCache ? 'cached' : 'fresh'})`,
           );
         }

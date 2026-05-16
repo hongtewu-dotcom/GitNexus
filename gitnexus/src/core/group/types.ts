@@ -41,16 +41,19 @@ export interface DetectConfig {
   /** Squirrel Redis cluster dependency detection (shared cache coupling). */
   squirrel: boolean;
   /** Shepherd API gateway route resolution (fetch routes from gateway config). */
-  shepherd?: ShepherdDetectConfig | boolean;
+  shepherd?: ShepherdDetectConfig | ShepherdDetectConfig[] | boolean;
 }
 
 /**
  * Shepherd gateway detection config. When specified as `true` in group.yaml,
  * defaults are used. When specified as an object, allows fine-grained control.
+ * Supports multiple groups via `groups` array or by specifying `group` as an array.
  */
 export interface ShepherdDetectConfig {
-  /** Shepherd API group name (e.g. 'flight-m'). Required. */
-  group: string;
+  /** Shepherd API group name (e.g. 'flight-m'). Can be a single string or array for multi-group. Optional if `groups` is provided. */
+  group?: string | string[];
+  /** Alternative: explicit list of groups. Takes precedence over `group` if both specified. */
+  groups?: string[];
   /** Repo path in config.repos representing the gateway (e.g. 'api/gateway'). */
   gateway_repo?: string;
   /** SSO cookie value for Shepherd API authentication. */
