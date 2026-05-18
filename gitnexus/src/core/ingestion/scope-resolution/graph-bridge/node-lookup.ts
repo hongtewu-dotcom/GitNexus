@@ -20,6 +20,7 @@
 
 import type { NodeLabel } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import { templateConstraintsIdTag } from '../../utils/template-arguments.js';
 
 export type GraphNodeLookup = ReadonlyMap<string, string>;
 
@@ -67,6 +68,7 @@ export function buildGraphNodeLookup(graph: KnowledgeGraph): GraphNodeLookup {
       filePath?: string;
       name?: string;
       qualifiedName?: string;
+      templateArguments?: readonly string[];
     };
     if (props.filePath === undefined || props.name === undefined) continue;
     if (!isLinkableLabel(node.label)) continue;
@@ -95,6 +97,37 @@ export function buildGraphNodeLookup(graph: KnowledgeGraph): GraphNodeLookup {
         const pKey = qualifiedKey(props.filePath, node.label, `${qualified}~${pTypes.join(',')}`);
         // Each overload is unique — set unconditionally.
         lookup.set(pKey, node.id);
+      }
+      // SFINAE / `requires`-clause disambiguation (issue #1579) — register
+      // a constraint-fingerprinted key so resolveDefGraphId can locate the
+      // correct overload by hashing the def's `templateConstraints`. Mirrors
+      // the parameter-types key but keys on the opaque constraint payload
+      // instead, separating two `process<T>` overloads whose
+      // `parameterTypes=['T']` would otherwise collide.
+      const tConstraints = (props as { templateConstraints?: unknown }).templateConstraints;
+      if (tConstraints !== undefined && (node.label === 'Function' || node.label === 'Method')) {
+        const cKey = qualifiedKey(
+          props.filePath,
+          node.label,
+          `${qualified}${templateConstraintsIdTag(tConstraints)}`,
+        );
+        lookup.set(cKey, node.id);
+      }
+      if (
+        (node.label === 'Class' ||
+          node.label === 'Struct' ||
+          node.label === 'Interface' ||
+          node.label === 'Enum' ||
+          node.label === 'Record') &&
+        props.templateArguments !== undefined &&
+        props.templateArguments.length > 0
+      ) {
+        const tKey = qualifiedKey(
+          props.filePath,
+          node.label,
+          `${qualified}~${props.templateArguments.join(',')}`,
+        );
+        if (!lookup.has(tKey)) lookup.set(tKey, node.id);
       }
     }
 

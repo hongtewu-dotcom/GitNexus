@@ -1,4 +1,4 @@
-import type { GraphNode, GraphRelationship, NodeLabel } from 'gitnexus-shared';
+import type { GraphNode, GraphRelationship, NodeLabel, ParameterTypeClass } from 'gitnexus-shared';
 import { KnowledgeGraph } from '../graph/types.js';
 import Parser from 'tree-sitter';
 import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
@@ -30,6 +30,11 @@ import {
   constTagForId,
   buildCollisionGroups,
 } from './utils/method-props.js';
+import {
+  extractTemplateArguments,
+  templateArgumentsIdTag,
+  templateConstraintsIdTag,
+} from './utils/template-arguments.js';
 import type { LanguageProvider } from './language-provider.js';
 import type { ParsedFile } from 'gitnexus-shared';
 import { WorkerPool } from './workers/worker-pool.js';
@@ -127,8 +132,10 @@ export const mergeChunkResults = (
         parameterCount: sym.parameterCount,
         requiredParameterCount: sym.requiredParameterCount,
         parameterTypes: sym.parameterTypes,
+        parameterTypeClasses: sym.parameterTypeClasses,
         returnType: sym.returnType,
         declaredType: sym.declaredType,
+        templateArguments: sym.templateArguments,
         ownerId: sym.ownerId,
         qualifiedName: sym.qualifiedName,
       });
@@ -483,6 +490,23 @@ const processParsingSequential = async (
             })
           : null;
       const nodeLabel = extractedClassSymbol?.type ?? defaultNodeLabel;
+      const isClassLikeLabel =
+        nodeLabel === 'Class' ||
+        nodeLabel === 'Struct' ||
+        nodeLabel === 'Interface' ||
+        nodeLabel === 'Enum' ||
+        nodeLabel === 'Record';
+      if (
+        isClassLikeLabel &&
+        provider.classExtractor?.shouldSkipClassCapture?.({
+          captureMap,
+          definitionNode,
+          nameNode,
+          nodeLabel,
+        }) === true
+      ) {
+        return;
+      }
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor' && !extractedClassSymbol) return;
       const nodeName = extractedClassSymbol?.name ?? (nameNode ? nameNode.text : 'init');
@@ -610,7 +634,60 @@ const processParsingSequential = async (
           cached.groups,
         );
       }
-      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}${arityTag}`);
+      const classTemplateArguments =
+        extractedClassSymbol?.templateArguments ??
+        provider.classExtractor?.extractTemplateArgumentsFromCapture?.({
+          captureMap,
+          definitionNode,
+          nameNode,
+        }) ??
+        (captureMap['template-arguments']
+          ? extractTemplateArguments(captureMap['template-arguments'].text)
+          : undefined) ??
+        (nameNode && nameNode.text ? extractTemplateArguments(nameNode.text) : undefined);
+      const classTemplateTag =
+        (nodeLabel === 'Class' ||
+          nodeLabel === 'Struct' ||
+          nodeLabel === 'Interface' ||
+          nodeLabel === 'Enum' ||
+          nodeLabel === 'Record') &&
+        classTemplateArguments !== undefined &&
+        classTemplateArguments.length > 0
+          ? templateArgumentsIdTag(classTemplateArguments)
+          : '';
+      // SFINAE / `requires`-clause aware ID disambiguation (issue #1579).
+      // Function-template overloads with identical parameterTypes but
+      // mutually-exclusive constraints (e.g. `enable_if_t<is_integral_v<T>>`
+      // vs `enable_if_t<is_floating_point_v<T>>`) need distinct graph
+      // nodes so the constraint-filter step in `narrowOverloadCandidates`
+      // has two candidates to narrow between. Without this tag they
+      // collapse to a single Function node and the SFINAE call resolves
+      // to only one edge regardless of which overload's constraint holds.
+      // The provider hook is the right invocation point — parsing-processor
+      // sees raw tree-sitter matches without the `@`-prefixed synthetic
+      // captures `scope-extractor` consumes, so we delegate extraction to
+      // the language adapter (C++ implements this; other languages opt out).
+      let parsedTemplateConstraints: unknown = undefined;
+      let constraintsTag = '';
+      if (
+        (nodeLabel === 'Function' || nodeLabel === 'Method') &&
+        provider.extractTemplateConstraints !== undefined &&
+        definitionNode !== null
+      ) {
+        try {
+          parsedTemplateConstraints = provider.extractTemplateConstraints(definitionNode);
+          if (parsedTemplateConstraints !== undefined) {
+            constraintsTag = templateConstraintsIdTag(parsedTemplateConstraints);
+          }
+        } catch {
+          parsedTemplateConstraints = undefined;
+          constraintsTag = '';
+        }
+      }
+      const nodeId = generateId(
+        nodeLabel,
+        `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${constraintsTag}`,
+      );
       const classNodeForSymbol = definitionNodeForRange || definitionNode || nameNode;
       const qualifiedTypeName =
         extractedClassSymbol?.qualifiedName ??
@@ -643,6 +720,12 @@ const processParsingSequential = async (
                   nodeName,
                 ),
           ...(qualifiedTypeName !== undefined ? { qualifiedName: qualifiedTypeName } : {}),
+          ...(classTemplateArguments !== undefined && classTemplateArguments.length > 0
+            ? { templateArguments: classTemplateArguments }
+            : {}),
+          ...(parsedTemplateConstraints !== undefined
+            ? { templateConstraints: parsedTemplateConstraints }
+            : {}),
           ...(frameworkHint
             ? {
                 astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
@@ -698,8 +781,10 @@ const processParsingSequential = async (
         parameterCount: methodProps.parameterCount as number | undefined,
         requiredParameterCount: methodProps.requiredParameterCount as number | undefined,
         parameterTypes: methodProps.parameterTypes as string[] | undefined,
+        parameterTypeClasses: methodProps.parameterTypeClasses as ParameterTypeClass[] | undefined,
         returnType: methodProps.returnType as string | undefined,
         declaredType,
+        templateArguments: classTemplateArguments,
         ownerId: enclosingClassId ?? undefined,
         qualifiedName: qualifiedTypeName,
       });

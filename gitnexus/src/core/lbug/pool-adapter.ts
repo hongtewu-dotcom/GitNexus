@@ -17,8 +17,12 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { loadFTSExtension } from './lbug-adapter.js';
-import { createLbugDatabase, isWalCorruptionError } from './lbug-config.js';
+import { isReadOnlyDbError, loadFTSExtension } from './lbug-adapter.js';
+import {
+  createLbugDatabase,
+  isWalCorruptionError,
+  WAL_RECOVERY_SUGGESTION,
+} from './lbug-config.js';
 
 /** Per-repo pool: one Database, many Connections */
 interface PoolEntry {
@@ -86,7 +90,9 @@ let MAX_POOL_SIZE = 5;
 export function setMaxPoolSize(size: number): () => void {
   const prev = MAX_POOL_SIZE;
   MAX_POOL_SIZE = Math.max(1, size);
-  return () => { MAX_POOL_SIZE = prev; };
+  return () => {
+    MAX_POOL_SIZE = prev;
+  };
 }
 /** Idle timeout before closing a repo's connections */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -386,8 +392,7 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
             break;
           } catch (retryErr) {
             throw new Error(
-              `LadybugDB WAL corruption detected for ${repoId}. ` +
-                `Run \`gitnexus analyze\` to rebuild the index. ` +
+              `LadybugDB WAL corruption detected for ${repoId}. ${WAL_RECOVERY_SUGGESTION} ` +
                 `(${retryErr instanceof Error ? retryErr.message : String(retryErr)})`,
             );
           }
@@ -606,30 +611,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 export const executeQuery = async (repoId: string, cypher: string): Promise<any[]> => {
-  const entry = pool.get(repoId);
-  if (!entry) {
-    throw new Error(`LadybugDB not initialized for repo "${repoId}". Call initLbug first.`);
-  }
-
-  if (isWriteQuery(cypher)) {
-    throw new Error('Write operations are not allowed. The pool adapter is read-only.');
-  }
-
-  entry.lastUsed = Date.now();
-
-  const conn = await checkout(entry);
-  silenceStdout();
-  activeQueryCount++;
-  try {
-    const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
-    const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
-    const rows = await result.getAll();
-    return rows;
-  } finally {
-    activeQueryCount--;
-    restoreStdout();
-    checkin(entry, conn);
-  }
+  return await executeParameterized(repoId, cypher, {});
 };
 
 /**
@@ -661,6 +643,11 @@ export const executeParameterized = async (
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
+  } catch (err) {
+    if (isReadOnlyDbError(err)) {
+      throw new Error('Write operations are not allowed. The pool adapter is read-only.');
+    }
+    throw err;
   } finally {
     activeQueryCount--;
     restoreStdout();
@@ -693,15 +680,3 @@ export const closeLbug = async (repoId?: string): Promise<void> => {
  * Check if a specific repo's pool is active
  */
 export const isLbugReady = (repoId: string): boolean => pool.has(repoId);
-
-/** Regex to detect write operations in user-supplied Cypher queries.
- * Note: CALL is NOT blocked — it's used for read-only FTS (CALL QUERY_FTS_INDEX)
- * and vector search (CALL QUERY_VECTOR_INDEX). The database is opened in
- * read-only mode as defense-in-depth against write procedures. */
-export const CYPHER_WRITE_RE =
-  /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH|FOREACH|INSTALL|LOAD)\b/i;
-
-/** Check if a Cypher query contains write operations */
-export function isWriteQuery(query: string): boolean {
-  return CYPHER_WRITE_RE.test(query);
-}

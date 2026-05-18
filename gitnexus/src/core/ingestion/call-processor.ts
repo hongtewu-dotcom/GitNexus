@@ -766,6 +766,15 @@ export const processCalls = async (
   importedRawReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
   heritageMap?: HeritageMap,
   bindingAccumulator?: BindingAccumulator,
+  /**
+   * Optional cache for compiled `Parser.Query` objects keyed by language name.
+   * When provided, compiled queries are reused across calls instead of being
+   * re-compiled from the query string for every file. Callers that invoke
+   * `processCalls` many times with single-file batches (e.g. the cross-file
+   * propagation phase) should pass a long-lived map here to avoid O(N)
+   * query recompilation overhead.
+   */
+  compiledQueryCache?: Map<SupportedLanguages, Parser.Query>,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -774,6 +783,7 @@ export const processCalls = async (
     propertyName: string;
     filePath: string;
     srcId: string;
+    line?: number;
   }[] = [];
   // Phase P cross-file: accumulate heritage across files for cross-file isSubclassOf.
   // Used as a secondary check when per-file parentMap lacks the relationship — helps
@@ -842,7 +852,11 @@ export const processCalls = async (
     let matches;
     try {
       const lang = parser.getLanguage();
-      const query = new Parser.Query(lang, queryStr);
+      let query = compiledQueryCache?.get(language);
+      if (!query) {
+        query = new Parser.Query(lang, queryStr);
+        compiledQueryCache?.set(language, query);
+      }
       matches = query.matches(tree.rootNode);
     } catch (queryError) {
       logger.warn({ queryError }, `Query error for ${file.path}:`);
@@ -1102,11 +1116,16 @@ export const processCalls = async (
             provider,
           );
           const srcId = enclosing || generateId('File', file.path);
-          // Defer resolution so write-access tracking sees the FINAL graph
-          // state — properties from the pre-pass are present, but receiver-type
-          // resolution can still depend on inference that completes during the
-          // main loop. Resolve after all files have been processed.
-          pendingWrites.push({ receiverTypeName, propertyName, filePath: file.path, srcId });
+          // Defer resolution: Ruby attr_accessor properties are registered during
+          // this same loop, so cross-file lookups fail if the declaring file hasn't
+          // been processed yet. Collect now, resolve after all files are done.
+          pendingWrites.push({
+            receiverTypeName,
+            propertyName,
+            filePath: file.path,
+            srcId,
+            line: captureMap['assignment'].startPosition.row + 1,
+          });
         }
         // Assignment-only capture (no @call sibling): skip the rest of this
         // forEach iteration — this acts as a `continue` in the match loop.
@@ -1516,7 +1535,10 @@ export const processCalls = async (
     );
     if (fieldOwner) {
       graph.addRelationship({
-        id: generateId('ACCESSES', `${pw.srcId}:${fieldOwner.nodeId}:write`),
+        id: generateId(
+          'ACCESSES',
+          `${pw.srcId}:${fieldOwner.nodeId}:write${pw.line !== undefined ? `:${pw.line}` : ''}`,
+        ),
         sourceId: pw.srcId,
         targetId: fieldOwner.nodeId,
         type: 'ACCESSES',
@@ -3113,7 +3135,10 @@ export const processAssignmentsFromExtracted = (
     const fieldOwner = resolveFieldOwnership(receiverTypeName, asn.propertyName, asn.filePath, ctx);
     if (!fieldOwner) continue;
     graph.addRelationship({
-      id: generateId('ACCESSES', `${asn.sourceId}:${fieldOwner.nodeId}:write`),
+      id: generateId(
+        'ACCESSES',
+        `${asn.sourceId}:${fieldOwner.nodeId}:write${asn.line !== undefined ? `:${asn.line}` : ''}`,
+      ),
       sourceId: asn.sourceId,
       targetId: fieldOwner.nodeId,
       type: 'ACCESSES',
