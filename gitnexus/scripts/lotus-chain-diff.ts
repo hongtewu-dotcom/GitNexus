@@ -95,8 +95,10 @@ const APPKEY_TO_REPO: Record<string, string> = {
   'com.sankuai.flight.merchant.center': 'merchant/center',
   'com.sankuai.flight.merchant.claw': 'merchant/claw',
   'com.sankuai.flight.merchant.ecm': 'merchant/ecm',
+  'com.sankuai.flightmerchant.selftrade': 'merchant/selftrade',
   'com.sankuai.flight.biz.merchant': 'merchant/center',
   'com.sankuai.flight.biz.distribution': 'merchant/distribution',
+  'com.sankuai.flight.biz.selfoperator': 'biz/selfoperator',
   // 业务
   'com.sankuai.flight.biz.assembler': 'biz/assembler',
   'com.sankuai.flight.biz.ebook': 'business/ebook',
@@ -155,7 +157,7 @@ interface MethodCall {
   methodName: string;
 }
 
-interface ChainDiffResult {
+  interface ChainDiffResult {
   traceName: string;
   logicTraceId: number;
   totalNodes: number;
@@ -174,6 +176,39 @@ interface ChainDiffResult {
   totalRpc: number;
   coveredRpc: number;
   rpcCoverageRate: number;
+  // Thrift-mode Dbus 维度（binlog listener 跨仓链路）
+  thriftDbusCovered: string[];   // 本链路覆盖的 thrift-mode dbus consumer contractIds
+  thriftDbusMissing: string[];   // 本链路未覆盖的 thrift-mode dbus consumer contractIds
+}
+
+// ============ 数据结构 ============
+interface StoredContract {
+  contractId: string;
+  type: string;
+  role: string;
+  repo: string;
+  service: string;
+  symbolUid: string;
+  symbolRef: { filePath: string; name: string };
+  symbolName: string;
+  confidence: number;
+  meta?: Record<string, unknown>;
+}
+
+/** DBus CDC contract index for coverage verification */
+interface DbusIndex {
+  /** topicName → dbus consumer contract (mafka mode) */
+  byTopic: Map<string, StoredContract>;
+  /** thriftServiceName → dbus consumer contract (thrift mode) */
+  byThriftService: Map<string, StoredContract>;
+  /** repo → dbus contracts[] */
+  byRepo: Map<string, StoredContract[]>;
+  /** repo → dbus contracts[] (same as byRepo, for direct lookup) */
+  byConsumerRepo: Map<string, StoredContract[]>;
+  /** dbus contractId → set of write-side repos (thrift mode only)
+   *  Write-side repos are determined from crossLinks where to.repo = consumer repo.
+   *  A dbus consumer is covered if ANY of its write-side repos is present in fixtures. */
+  writeSideRepos: Map<string, Set<string>>;
 }
 
 // ============ 加载 crossLinks ============
@@ -184,6 +219,13 @@ function loadCrossLinks(): CrossLink[] {
   const crossLinks: CrossLink[] = data.crossLinks || [];
   console.log(`  ✅ Loaded ${crossLinks.length} crossLinks`);
   return crossLinks;
+}
+
+// ============ 加载 contracts（用于 topic producer 回补） ============
+function loadContracts(): StoredContract[] {
+  const content = fs.readFileSync(CONTRACTS_FILE, 'utf-8');
+  const data = JSON.parse(content);
+  return data.contracts || [];
 }
 
 // ============ 构建 crossLinks 索引 ============
@@ -198,16 +240,60 @@ interface CrossLinkIndex {
   byTopic: Map<string, CrossLink[]>;
   // key: "repo::topicName" → crossLinks[] (repo 维度的 topic 索引)
   byRepoTopic: Map<string, CrossLink[]>;
+  // Producer-only 补充索引: topics with provider contracts but no consumer crossLink
+  // (same-repo self-call like fd_check_dispatcher in basis/fare)
+  // key: topicName (lowercase) → provider repo
+  producerOnlyTopics: Map<string, string>;
+  // key: repo → Map<topicName, topicName>
+  producerOnlyRepoTopic: Map<string, Map<string, string>>;
 }
 
-function buildCrossLinkIndex(crossLinks: CrossLink[]): CrossLinkIndex {
+function buildCrossLinkIndex(crossLinks: CrossLink[], contracts: StoredContract[]): { index: CrossLinkIndex; dbusIndex: DbusIndex } {
   const index: CrossLinkIndex = {
     byTargetMethod: new Map(),
     byTargetService: new Map(),
     byTargetRepo: new Map(),
     byTopic: new Map(),
     byRepoTopic: new Map(),
+    producerOnlyTopics: new Map(),
+    producerOnlyRepoTopic: new Map(),
   };
+
+  const dbusIndex: DbusIndex = {
+    byTopic: new Map(),
+    byThriftService: new Map(),
+    byRepo: new Map(),
+    byConsumerRepo: new Map(),
+    writeSideRepos: new Map(),
+  };
+
+  // Step 1: identify topics that have consumer crossLinks
+  const topicHasConsumer = new Set<string>();
+  for (const cl of crossLinks) {
+    if (cl.contractId.startsWith('topic::')) {
+      topicHasConsumer.add(cl.contractId.replace('topic::', '').toLowerCase());
+    }
+  }
+
+  // Step 2: find topics with provider contracts but no consumer crossLink
+  // → same-repo self-call (e.g. fd_check_dispatcher in basis/fare)
+  for (const c of contracts) {
+    if (c.type !== 'topic' || c.role !== 'provider') continue;
+    const topicLower = (c.meta?.topicName as string || '').toLowerCase();
+    if (!topicLower) continue;
+    if (topicHasConsumer.has(topicLower)) continue;
+    const providerRepo = (c.repo || '').toLowerCase();
+    if (!providerRepo) continue;
+    // Register topic if new
+    if (!index.producerOnlyTopics.has(topicLower)) {
+      index.producerOnlyTopics.set(topicLower, providerRepo);
+    }
+    // Ensure repo map exists for this topic
+    if (!index.producerOnlyRepoTopic.has(providerRepo)) {
+      index.producerOnlyRepoTopic.set(providerRepo, new Map());
+    }
+    index.producerOnlyRepoTopic.get(providerRepo)!.set(topicLower, topicLower);
+  }
 
   for (const cl of crossLinks) {
     const targetRepo = cl.to.repo;
@@ -276,7 +362,117 @@ function buildCrossLinkIndex(crossLinks: CrossLink[]): CrossLinkIndex {
     }
   }
 
-  return index;
+  // Build dbus index from contracts.
+  // Supports two contract types:
+  //   - type='topic': topic contracts from MafkaPropertiesExtractor.
+  //     Dbus topics are identified by DBUS_NAME_RE pattern in topic name (extracted from contractId).
+  //   - type='dbus': explicit dbus contracts from DbusExtractor.
+  //
+  // Note: contracts.json uses { from, to, type, contractId } format.
+  //   - contractId for topics: "topic::<name>"
+  //   - contractId for dbus: "dbus::topicName" or "dbus::thrift::serviceName"
+  //   - Repo is in c.from.repo (consumer) and c.to.repo (producer)
+  const DBUS_NAME_RE = /\b(dbus|databus|dts)\b/i;
+
+  for (const c of contracts) {
+    let topicName = '';
+    let isDbus = false;
+
+    if (c.type === 'topic') {
+      // Extract topic name from contractId (format: "topic::<name>")
+      // contracts.json has no meta field; topic name is encoded in contractId
+      topicName = c.contractId.replace(/^topic::/, '');
+      isDbus = DBUS_NAME_RE.test(topicName);
+    } else if (c.type === 'dbus') {
+      // DbusExtractor: contractId format is 'dbus::topicName' or 'dbus::thrift::serviceName'
+      topicName = c.contractId.replace(/^dbus::(?:thrift::)?/, '');
+      isDbus = true;
+    } else {
+      continue;
+    }
+
+    if (!isDbus || !topicName) continue;
+
+    const topicKey = topicName.toLowerCase();
+    if (!dbusIndex.byTopic.has(topicKey)) {
+      dbusIndex.byTopic.set(topicKey, c);
+    }
+
+    // Also index by thriftService for dbus contracts (thrift-mode consumers).
+    // makeDbusContract() doesn't set meta.thriftService, so we extract the
+    // service name from contractId (format: "dbus::thrift::ServiceName").
+    if (c.type === 'dbus') {
+      const meta = c.meta as Record<string, unknown> | undefined;
+      let thriftService = meta?.thriftService as string | undefined;
+      if (!thriftService) {
+        // contractId like "dbus::thrift::DataBusThriftService" -> extract "DataBusThriftService"
+        if (c.contractId.startsWith('dbus::thrift::')) {
+          thriftService = c.contractId.split('::').pop()!;
+        }
+      }
+      if (thriftService) {
+        const svcKey = thriftService.toLowerCase();
+        if (!dbusIndex.byThriftService.has(svcKey)) {
+          dbusIndex.byThriftService.set(svcKey, c);
+        }
+      }
+    }
+
+    // Index by consumer repo (from StoredContract.repo field)
+    // Note: StoredContract has 'repo' field directly (set to groupPath in sync.ts),
+    // NOT 'from.repo'.
+    const consumerRepo = c.repo;
+    if (consumerRepo) {
+      const repoList = dbusIndex.byRepo.get(consumerRepo) || [];
+      repoList.push(c);
+      dbusIndex.byRepo.set(consumerRepo, repoList);
+
+      // byConsumerRepo: same data for direct lookup
+      const consumerList = dbusIndex.byConsumerRepo.get(consumerRepo) || [];
+      consumerList.push(c);
+      dbusIndex.byConsumerRepo.set(consumerRepo, consumerList);
+    }
+  }
+
+  // Populate writeSideRepos: prefer meta.writeSideRepos (from deriveDbusWriteSides in sync.ts),
+  // fallback to crossLinks-based inference (for contracts.json that hasn't been re-synced yet).
+  let hasMetaWriteSide = false;
+  for (const c of contracts) {
+    if (c.type !== 'dbus' || c.role !== 'consumer') continue;
+    const writeSide = c.meta?.writeSideRepos as string[] | undefined;
+    if (!writeSide || writeSide.length === 0) continue;
+    hasMetaWriteSide = true;
+    const contractId = (c.contractId || '').toLowerCase();
+    if (!dbusIndex.writeSideRepos.has(contractId)) {
+      dbusIndex.writeSideRepos.set(contractId, new Set());
+    }
+    for (const r of writeSide) {
+      dbusIndex.writeSideRepos.get(contractId)!.add(r.toLowerCase());
+    }
+  }
+
+  // Fallback: if no contracts have meta.writeSideRepos, derive from crossLinks.
+  // For each crossLink targeting a dbus consumer repo, record the write-side repo.
+  if (!hasMetaWriteSide) {
+    for (const cl of crossLinks) {
+      const toRepo = (cl.to?.repo || '').toLowerCase();
+      if (!toRepo) continue;
+      const fromRepo = (cl.from?.repo || '').toLowerCase();
+      if (!fromRepo || fromRepo === toRepo) continue;
+
+      if (dbusIndex.byConsumerRepo.has(toRepo)) {
+        for (const c of dbusIndex.byConsumerRepo.get(toRepo)!) {
+          const contractId = (c.contractId || '').toLowerCase();
+          if (!dbusIndex.writeSideRepos.has(contractId)) {
+            dbusIndex.writeSideRepos.set(contractId, new Set());
+          }
+          dbusIndex.writeSideRepos.get(contractId)!.add(fromRepo);
+        }
+      }
+    }
+  }
+
+  return { index, dbusIndex };
 }
 
 // ============ 解析 Lotus 链路中的方法调用 ============
@@ -299,8 +495,8 @@ function extractMethodCalls(chain: LotusChainFile): MethodCall[] {
     let methodName: string;
     const nodeType = node.type.toLowerCase();
 
-    if (nodeType === 'mafka' || nodeType === 'topic') {
-      // Mafka Topic 节点: method = "topic::topicName"
+    if (nodeType === 'mafka' || nodeType === 'topic' || nodeType === 'dbus') {
+      // Mafka/DBus Topic 节点: method = "topic::topicName"
       const topicName = node.method.replace(/^topic::/, '');
       serviceName = topicName;
       methodName = topicName;
@@ -329,20 +525,43 @@ function extractMethodCalls(chain: LotusChainFile): MethodCall[] {
 }
 
 // ============ 匹配方法调用与 crossLinks ============
-function matchMethodCall(call: MethodCall, index: CrossLinkIndex): boolean {
+function matchMethodCall(call: MethodCall, index: CrossLinkIndex, dbusIndex: DbusIndex): boolean {
   if (!call.repo) return false;
 
   const callType = call.type.toLowerCase();
 
-  // Mafka Topic 节点：匹配 topic crossLinks
-  if (callType === 'mafka' || callType === 'topic') {
+  // Mafka/DBus Topic 节点：匹配 topic crossLinks 和 dbus index
+  if (callType === 'mafka' || callType === 'topic' || callType === 'dbus') {
     const topicName = call.method.replace(/^topic::/, '').toLowerCase();
     // 策略1: repo + topic 精确匹配
     const rtKey = `${call.repo}::${topicName}`;
     if (index.byRepoTopic.has(rtKey)) return true;
     // 策略2: 全局 topic 名匹配（topic 可能连接不同 repo）
     if (index.byTopic.has(topicName)) return true;
+    // 策略3: producer-only 补充（same-repo 自产自销，如 fd_check_dispatcher）
+    if (index.producerOnlyTopics.has(topicName)) return true;
+    const repoTopics = index.producerOnlyRepoTopic.get(call.repo);
+    if (repoTopics && repoTopics.has(topicName)) return true;
+    // 策略4: dbus index 补充（如果该 topic 是 dbus topic，dbus consumer 也算覆盖）
+    if (dbusIndex.byTopic.has(topicName)) return true;
     return false;
+  }
+
+  // Thrift 模式 DBus 消费者：匹配 dbus thrift service 索引
+  if (dbusIndex.byThriftService.size > 0) {
+    const simpleSvcName = call.serviceName.split('.').pop()!;
+    // 精确检查 thrift service 简名
+    if (dbusIndex.byThriftService.has(simpleSvcName.toLowerCase())) return true;
+    // 也检查全限定名
+    if (dbusIndex.byThriftService.has(call.serviceName.toLowerCase())) return true;
+    // 遍历检查尾部匹配（如 OrderSearchDataBusService → DataBusEventServiceV2）
+    for (const [svcKey] of dbusIndex.byThriftService) {
+      if (call.serviceName.toLowerCase().endsWith('.' + svcKey) ||
+          call.serviceName.toLowerCase() === svcKey ||
+          simpleSvcName.toLowerCase() === svcKey) {
+        return true;
+      }
+    }
   }
 
   // HTTP 节点：method 是 path，toLowerCase 后与索引的 http path 匹配
@@ -373,6 +592,20 @@ function matchMethodCall(call: MethodCall, index: CrossLinkIndex): boolean {
   // 策略1: 精确匹配 "repo::ServiceName/methodName"
   const exactKey = `${call.repo}::${call.serviceName}/${call.methodName}`.toLowerCase();
   if (index.byTargetMethod.has(exactKey)) return true;
+  // 策略0.5: DBus thrift service 快速路径（对 thrift 模式 dbus consumer 的特殊匹配）
+  // 如 OrderSearchDataBusService、DataBusEventServiceV2 等 thrift 服务
+  if (dbusIndex.byThriftService.size > 0) {
+    const simpleSvcName2 = call.serviceName.split('.').pop()!;
+    if (dbusIndex.byThriftService.has(simpleSvcName2.toLowerCase())) return true;
+    if (dbusIndex.byThriftService.has(call.serviceName.toLowerCase())) return true;
+    for (const [svcKey] of dbusIndex.byThriftService) {
+      if (call.serviceName.toLowerCase().endsWith('.' + svcKey) ||
+          call.serviceName.toLowerCase() === svcKey ||
+          simpleSvcName2.toLowerCase() === svcKey) {
+        return true;
+      }
+    }
+  }
 
   // 策略2: 简名匹配（Lotus 可能用简名，gitnexus 用全限定名）
   // 比如 Lotus: "UOrderQueryThriftService.getUOrderDetail"
@@ -397,7 +630,7 @@ function matchMethodCall(call: MethodCall, index: CrossLinkIndex): boolean {
 }
 
 // ============ 对单条链路做比对 ============
-function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResult {
+function diffChain(chain: LotusChainFile, index: CrossLinkIndex, dbusIndex: DbusIndex): ChainDiffResult {
   const calls = extractMethodCalls(chain);
   const internalCalls = calls.filter(c => c.repo !== null);
   const externalCalls = calls.filter(c => c.repo === null);
@@ -406,7 +639,7 @@ function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResul
   const missingCalls: MethodCall[] = [];
 
   for (const call of internalCalls) {
-    if (matchMethodCall(call, index)) {
+    if (matchMethodCall(call, index, dbusIndex)) {
       coveredCalls.push(call);
     } else {
       missingCalls.push(call);
@@ -416,13 +649,51 @@ function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResul
   // 分离 Topic 和 RPC/HTTP 维度统计
   const isTopic = (c: MethodCall) => {
     const t = c.type.toLowerCase();
-    return t === 'mafka' || t === 'topic';
+    return t === 'mafka' || t === 'topic' || t === 'dbus';
   };
   const internalTopics = internalCalls.filter(isTopic);
   const coveredTopicCalls = coveredCalls.filter(isTopic);
   const missingTopicCalls = missingCalls.filter(isTopic);
   const internalRpc = internalCalls.filter(c => !isTopic(c));
   const coveredRpcCalls = coveredCalls.filter(c => !isTopic(c));
+
+  // Compute thrift-mode dbus coverage: for each thrift dbus contract,
+  // check if any of its write-side repos is present in this fixture.
+  const fixtureRepos = new Set<string>();
+  for (const node of chain.nodes) {
+    const repo = (node as any).repo || APPKEY_TO_REPO[node.appkey] || null;
+    if (repo) fixtureRepos.add(repo.toLowerCase());
+  }
+
+  // Thrift-mode dbus coverage: return per-chain covered/missing sets.
+  // A consumer is "covered" in a chain if ANY of its write-side repos appears in that fixture.
+  // Per-chain sets may overlap (same contract appears in multiple chains).
+  const thriftDbusCoveredSet = new Set<string>();
+  const thriftDbusMissingSet = new Set<string>();
+  for (const [svcKey, contract] of dbusIndex.byThriftService) {
+    const contractId = (contract.contractId || '').toLowerCase();
+    const writeSideSet = dbusIndex.writeSideRepos.get(contractId);
+    if (!writeSideSet || writeSideSet.size === 0) {
+      // No crossLinks pointing to this consumer -> write-side unknown, mark as missing
+      thriftDbusMissingSet.add(contractId);
+      continue;
+    }
+    // Covered if any write-side repo is in the fixture
+    let covered = false;
+    for (const wr of writeSideSet) {
+      if (fixtureRepos.has(wr.toLowerCase())) {
+        covered = true;
+        break;
+      }
+    }
+    if (covered) {
+      thriftDbusCoveredSet.add(contractId);
+    } else {
+      thriftDbusMissingSet.add(contractId);
+    }
+  }
+  const thriftDbusCovered = [...thriftDbusCoveredSet];
+  const thriftDbusMissing = [...thriftDbusMissingSet];
 
   return {
     traceName: chain.traceName,
@@ -447,11 +718,19 @@ function diffChain(chain: LotusChainFile, index: CrossLinkIndex): ChainDiffResul
     rpcCoverageRate: internalRpc.length > 0
       ? coveredRpcCalls.length / internalRpc.length
       : 0,
+    thriftDbusCovered,
+    thriftDbusMissing,
   };
 }
 
 // ============ 输出报告 ============
-function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFiles: string[]): void {
+function printReport(
+  results: ChainDiffResult[],
+  summaryOnly: boolean,
+  chainFiles: string[],
+  dbusIndex: DbusIndex,
+  thriftStats: { total: number; covered: number; missing: Set<string>; coveredSet: Set<string> },
+): void {
   console.log('\n' + '═'.repeat(80));
   console.log('  🔗 Lotus Chain-Level Coverage Report');
   console.log('  Comparing Lotus physical-combined chains vs GitNexus crossLinks');
@@ -464,7 +743,7 @@ function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFile
   const totalMethods = results.reduce((s, r) => s + r.totalMethods, 0);
   const overallRate = totalInternal > 0 ? (totalCovered / totalInternal * 100).toFixed(1) : '0';
 
-  // Topic 维度汇总
+  // Topic 维度汇总（mafka mode dbus）
   const totalTopics = results.reduce((s, r) => s + r.totalTopics, 0);
   const totalCoveredTopics = results.reduce((s, r) => s + r.coveredTopics, 0);
   const topicRate = totalTopics > 0 ? (totalCoveredTopics / totalTopics * 100).toFixed(1) : 'N/A';
@@ -472,6 +751,17 @@ function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFile
   const totalRpc = results.reduce((s, r) => s + r.totalRpc, 0);
   const totalCoveredRpc = results.reduce((s, r) => s + r.coveredRpc, 0);
   const rpcRate = totalRpc > 0 ? (totalCoveredRpc / totalRpc * 100).toFixed(1) : 'N/A';
+  // Thrift-mode Dbus 维度汇总（binlog listener，由 write-side 触发）
+  // Aggregation rule: a dbus consumer is globally "covered" if ANY fixture covers it
+  // (i.e., any fixture contains a write-side repo that triggers the binlog listener).
+  // It is globally "missing" only if NO fixture contains any of its write-side repos.
+  const allContracts = new Set([...thriftStats.coveredSet, ...thriftStats.missing]);
+  const totalThrift = allContracts.size;
+  const totalCoveredThrift = thriftStats.coveredSet.size;
+  const thriftRate = totalThrift > 0 ? (totalCoveredThrift / totalThrift * 100).toFixed(1) : 'N/A';
+  // Missing = contracts that appear in missing set but NOT in covered set
+  const allThriftMissing = new Set([...thriftStats.missing].filter(c => !thriftStats.coveredSet.has(c)));
+  const allThriftCovered = thriftStats.coveredSet;
 
   console.log(`\n  📊 Overall Summary:`);
   console.log(`     Chains analyzed:         ${results.length}`);
@@ -483,8 +773,9 @@ function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFile
   console.log(`     ────────────────────────────────`);
   console.log(`     Overall Coverage:        ${overallRate}%`);
   console.log(``);
-  console.log(`     📡 RPC/HTTP Coverage:    ${totalCoveredRpc}/${totalRpc} = ${rpcRate}%`);
-  console.log(`     📨 Mafka Topic Coverage: ${totalCoveredTopics}/${totalTopics} = ${topicRate}%`);
+  console.log(`     📡 RPC/HTTP Coverage:      ${totalCoveredRpc}/${totalRpc} = ${rpcRate}%`);
+  console.log(`     📨 Mafka Topic Coverage:   ${totalCoveredTopics}/${totalTopics} = ${topicRate}%`);
+  console.log(`     🔄 Thrift Dbus Coverage:   ${totalCoveredThrift}/${totalThrift} = ${thriftRate}%`);
 
   // 每条链路
   console.log('\n  📋 Per-Chain Results:');
@@ -514,6 +805,29 @@ function printReport(results: ChainDiffResult[], summaryOnly: boolean, chainFile
 
   // Mafka Topic 缺失详情
   const allMissingTopics = results.flatMap(r => r.missingTopics.map(t => ({ ...t, trace: r.traceName })));
+  // Thrift-mode Dbus 缺失详情
+  if (allThriftMissing.size > 0) {
+    console.log(`\n  🔄 Missing Thrift Dbus Consumers (${allThriftMissing.size} missing):`);
+    console.log('  ' + '─'.repeat(78));
+    const sortedMissing = [...allThriftMissing].sort();
+    for (const contractId of sortedMissing) {
+      const writeSide = dbusIndex.writeSideRepos.get(contractId);
+      const ws = writeSide ? [...writeSide].sort().join(', ') : '(unknown)';
+      console.log(`    ✗ ${contractId}`);
+      console.log(`       write-side: ${ws}`);
+    }
+    // Also list covered thrift dbus for completeness
+    console.log(`\n  ✅ Covered Thrift Dbus Consumers (${allThriftCovered.size}):`);
+    console.log('  ' + '─'.repeat(78));
+    const sortedCovered = [...allThriftCovered].sort();
+    for (const contractId of sortedCovered) {
+      const writeSide = dbusIndex.writeSideRepos.get(contractId);
+      const ws = writeSide ? [...writeSide].sort().join(', ') : '(unknown)';
+      console.log(`    ✓ ${contractId}`);
+      console.log(`       write-side: ${ws}`);
+    }
+  }
+
   if (allMissingTopics.length > 0) {
     const uniqueTopics = [...new Set(allMissingTopics.map(t => t.method))];
     console.log(`\n  📨 Missing Mafka Topics (${uniqueTopics.length} unique):`);
@@ -614,20 +928,40 @@ async function main() {
   console.log('');
 
   // 加载 crossLinks
+  const contracts = loadContracts();
   const crossLinks = loadCrossLinks();
-  const index = buildCrossLinkIndex(crossLinks);
-  console.log(`📇 Index: ${index.byTargetMethod.size} target methods, ${index.byTargetService.size} target services, ${index.byTargetRepo.size} target repos, ${index.byTopic.size} topics, ${index.byRepoTopic.size} repo-topic pairs`);
+  const { index, dbusIndex } = buildCrossLinkIndex(crossLinks, contracts);
+  console.log(`📇 Index: ${index.byTargetMethod.size} target methods, ${index.byTargetService.size} target services, ${index.byTargetRepo.size} target repos, ${index.byTopic.size} topics, ${index.byRepoTopic.size} repo-topic pairs, ${index.producerOnlyTopics.size} producer-only topics, ${dbusIndex.byTopic.size} dbus topics, ${dbusIndex.byThriftService.size} dbus thrift services`);
 
   // 比对每条链路
   const results: ChainDiffResult[] = [];
   for (const file of chainFiles) {
     const chain: LotusChainFile = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    const result = diffChain(chain, index);
+    const result = diffChain(chain, index, dbusIndex);
     results.push(result);
   }
 
   // 输出报告
-  printReport(results, summaryOnly, chainFiles);
+  // Compute thrift dbus coverage stats for report
+  const allThriftCoveredSet = new Set<string>();
+  const allThriftMissingSet = new Set<string>();
+  for (const r of results) {
+    for (const c of r.thriftDbusCovered) allThriftCoveredSet.add(c);
+    for (const m of r.thriftDbusMissing) allThriftMissingSet.add(m);
+  }
+  // allThriftCoveredSet 和 allThriftMissingSet 可能有交集（同一 handler 在某些链路覆盖、另一些链路未覆盖）
+  // total 应取并集去重，covered handler 只要在任意链路被覆盖即算覆盖
+  const allThriftUnion = new Set([...allThriftCoveredSet, ...allThriftMissingSet]);
+  // 真正未覆盖 = 从未出现在任何链路的 covered 集合中的 handler
+  const trulyMissing = new Set([...allThriftMissingSet].filter(h => !allThriftCoveredSet.has(h)));
+  const thriftStats = {
+    total: allThriftUnion.size,
+    covered: allThriftCoveredSet.size,
+    missing: trulyMissing,
+    coveredSet: allThriftCoveredSet,
+  };
+
+  printReport(results, summaryOnly, chainFiles, dbusIndex, thriftStats);
 
   // 保存 JSON 报告
   const reportPath = path.join(GROUP_DIR, 'lotus-chain-diff-report.json');
@@ -663,6 +997,12 @@ async function main() {
         repo: m.repo,
         topic: m.method,
       }))),
+      // Thrift-mode Dbus 维度
+      totalThriftDbus: thriftStats.total,
+      coveredThriftDbus: thriftStats.covered,
+      thriftDbusCoverageRate: thriftStats.total > 0 ? thriftStats.covered / thriftStats.total : 0,
+      thriftDbusMissing: [...trulyMissing].sort(),
+      thriftDbusCovered: [...allThriftCoveredSet].sort(),
     },
     chains: results.map(r => ({
       traceName: r.traceName,
@@ -692,6 +1032,9 @@ async function main() {
         repo: m.repo,
         topic: m.method,
       })),
+      // Thrift-mode Dbus 维度
+      thriftDbusCovered: r.thriftDbusCovered,
+      thriftDbusMissing: r.thriftDbusMissing,
     })),
   }, null, 2));
   console.log(`\n💾 Report saved to: ${reportPath}`);

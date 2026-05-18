@@ -1,4 +1,4 @@
-export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custom' | 'include';
+export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'dbus' | 'lib' | 'custom' | 'include';
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
@@ -40,6 +40,8 @@ export interface DetectConfig {
   crane: boolean;
   /** Squirrel Redis cluster dependency detection (shared cache coupling). */
   squirrel: boolean;
+  /** DBus CDC topic and thrift service detection. */
+  dbus?: boolean;
   /** Shepherd API gateway route resolution (fetch routes from gateway config). */
   shepherd?: ShepherdDetectConfig | ShepherdDetectConfig[] | boolean;
 }

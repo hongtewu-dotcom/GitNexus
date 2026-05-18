@@ -22,6 +22,9 @@ import type { ExtractedContract, RepoHandle } from '../types.js';
  * falls back to the synthetic "mafkaConsumer(topic)" format.
  */
 
+/** Matches dbus-related topic names */
+const DBUS_TOPIC_RE = /\b(dbus|databus|dts)\b/i;
+
 /** Matches any mdp.mafka.{role}[N].{prop} = {value} line */
 const PROP_PATTERN = /^mdp\.mafka\.(consumers?|producers?)\[(\d+)\]\.(\w+)\s*=\s*(.+)$/;
 
@@ -94,6 +97,7 @@ function makeContract(
     meta: {
       broker: 'mafka',
       topicName,
+      isDbusTopic: DBUS_TOPIC_RE.test(topicName),
       extractionStrategy: 'properties_scan',
     },
   };

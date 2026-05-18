@@ -368,6 +368,8 @@ export class ManifestExtractor {
         return `custom::${contract}`;
       case 'include':
         return `include::${contract}`;
+      case 'dbus':
+        return `dbus::${contract}`;
       default: {
         const _exhaustive: never = type;
         throw new Error(`Unhandled ContractType: ${String(_exhaustive)}`);

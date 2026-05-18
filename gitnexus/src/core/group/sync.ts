@@ -14,6 +14,7 @@ import { ExternalIoExtractor } from './extractors/external-io-extractor.js';
 import { HttpConsumerExtractor } from './extractors/http-consumer-extractor.js';
 import { CraneExtractor } from './extractors/crane-extractor.js';
 import { SquirrelExtractor } from './extractors/squirrel-extractor.js';
+import { DbusExtractor } from './extractors/dbus-extractor.js';
 import { ManifestExtractor } from './extractors/manifest-extractor.js';
 import { discoverWorkspaceLinks } from './extractors/workspace-extractor.js';
 import { resolveShepherdRoutes, resolveMultipleShepherdGroups, type ShepherdConfig } from './extractors/shepherd-route-resolver.js';
@@ -194,8 +195,12 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
     const httpConsumerEx = new HttpConsumerExtractor();
     const craneEx = new CraneExtractor();
     const squirrelEx = new SquirrelExtractor();
+    const dbusEx = new DbusExtractor();
     dbExecutors = new Map<string, CypherExecutor>();
     const openPoolIds: string[] = [];
+    // tableName (lowercase) → set of repos that write it, collected while each
+    // repo's connection pool is still open. Used by deriveDbusWriteSides below.
+    const tableToWriteRepos = new Map<string, Set<string>>();
 
     try {
       for (const [groupPath, regName] of Object.entries(config.repos)) {
@@ -334,6 +339,37 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
             }
           }
 
+          // DBus CDC topic and thrift service detection
+          if (config.detect.dbus) {
+            const extracted = await dbusEx.extract(executor, handle.repoPath, handle);
+            for (const c of extracted) {
+              autoContracts.push({
+                ...c,
+                repo: groupPath,
+                service: assignService(c.symbolRef.filePath, boundaries),
+              });
+            }
+            // Collect QUERIES edges for this repo while its pool is still open.
+            // This feeds deriveDbusWriteSides after the loop.
+            try {
+              const rows = await executor(
+                'MATCH ()-[r:CodeRelation {type: "QUERIES"}]->(t:CodeElement) RETURN DISTINCT t.name AS tableName',
+                {},
+              );
+              for (const row of rows) {
+                const name = (row['tableName'] as string | undefined)?.toLowerCase();
+                if (!name) continue;
+                if (!tableToWriteRepos.has(name)) tableToWriteRepos.set(name, new Set());
+                tableToWriteRepos.get(name)!.add(groupPath);
+              }
+            } catch (err) {
+              logger.warn(
+                { repo: groupPath, err: err instanceof Error ? err.message : String(err) },
+                '[sync] QUERIES collection failed for repo',
+              );
+            }
+          }
+
           const metaPath = path.join(handle.storagePath, 'meta.json');
           try {
             const raw = await fs.readFile(metaPath, 'utf-8');
@@ -353,6 +389,8 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
           missingRepos.push(groupPath);
         }
       }
+      // All per-repo QUERIES edges collected. Derive writeSideRepos for dbus consumers.
+      deriveDbusWriteSides(autoContracts, tableToWriteRepos);
     } finally {
       for (const id of [...new Set(openPoolIds)]) {
         await closeLbug(id).catch(() => {});
@@ -520,4 +558,44 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
     missingRepos,
     repoSnapshots,
   };
+}
+
+/**
+ * For each thrift-mode dbus consumer contract, find which repos write the
+ * tables it listens to using a pre-built tableToWriteRepos map (collected
+ * per-repo while each pool was still open). Mutates contracts in-place.
+ *
+ * tableToWriteRepos: tableName (lowercase) → set of groupPath strings that
+ * have a QUERIES edge pointing at a CodeElement with that name.
+ * groupPath equals StoredContract.repo, so self-exclusion (c.repo) is exact.
+ */
+function deriveDbusWriteSides(
+  contracts: StoredContract[],
+  tableToWriteRepos: Map<string, Set<string>>,
+): void {
+  if (tableToWriteRepos.size === 0) return;
+
+  for (const c of contracts) {
+    // Only thrift-mode consumers have QUERIES edges to match against.
+    // Mafka-mode dbus consumers (contractId: dbus::<topicName>) are linked via
+    // topic name, not DB table QUERIES edges, so they are intentionally excluded.
+    if (c.type !== 'dbus' || c.role !== 'consumer' || !c.contractId.startsWith('dbus::thrift::')) {
+      continue;
+    }
+    const tableNames = (c.meta?.tableNames as string[] | undefined) ?? [];
+    if (tableNames.length === 0) continue;
+
+    const writeSide = new Set<string>();
+    for (const table of tableNames) {
+      const repos = tableToWriteRepos.get(table.toLowerCase());
+      if (repos) {
+        for (const r of repos) {
+          if (r !== c.repo) writeSide.add(r);
+        }
+      }
+    }
+    if (writeSide.size > 0) {
+      c.meta = { ...c.meta, writeSideRepos: [...writeSide].sort() };
+    }
+  }
 }

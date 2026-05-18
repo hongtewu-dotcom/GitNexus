@@ -386,6 +386,120 @@ export function listDefaults() {
       expect(consumers.find((c) => c.contractId === 'http::GET::/api/defaults')).toBeDefined();
     });
 
+    it('resolves ${PREFIX} template literals in axios object form url', async () => {
+      const dir = path.join(tmpDir, 'axios-prefix-template');
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src/api.js'),
+        `
+import axios from 'config/axios.config';
+const PREFIX = '/b/selfoperator/policyCodeConfig';
+
+export default {
+  queryList(data) {
+    return axios({ url: \`\${PREFIX}/queryPolicyCodeConfigs\`, method: 'POST', data });
+  },
+  queryDetail(data) {
+    return axios({ url: \`\${PREFIX}/queryPolicyCodeConfigDetail\`, method: 'POST', data });
+  },
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, dir, makeRepo(dir));
+      const consumers = contracts.filter((c) => c.role === 'consumer');
+
+      // PREFIX resolved → full path in contractId
+      expect(
+        consumers.find((c) => c.contractId === 'http::POST::/b/selfoperator/policycodeconfig/querypolicycodeconfigs'),
+      ).toBeDefined();
+      expect(
+        consumers.find((c) => c.contractId === 'http::POST::/b/selfoperator/policycodeconfig/querypolicycodeconfigdetail'),
+      ).toBeDefined();
+    });
+
+    it('resolves multiple ${} substitutions in axios template url', async () => {
+      const dir = path.join(tmpDir, 'axios-multi-prefix');
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src/api.js'),
+        `
+import axios from 'config/axios.config';
+const HOST = '/b';
+const MODULE = '/lowprice';
+
+export default {
+  query() {
+    return axios({ url: \`\${HOST}\${MODULE}/queryList\`, method: 'GET' });
+  },
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, dir, makeRepo(dir));
+      const consumers = contracts.filter((c) => c.role === 'consumer');
+
+      expect(
+        consumers.find((c) => c.contractId === 'http::GET::/b/lowprice/querylist'),
+      ).toBeDefined();
+    });
+
+    it('resolves PREFIX without leading slash in axios template url', async () => {
+      const dir = path.join(tmpDir, 'axios-prefix-no-slash');
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src/api.js'),
+        `
+import axios from 'config/axios.config';
+const PREFIX = 'b/lowprice/compare_price';
+
+export default {
+  query(params) {
+    return axios({ url: \`\${PREFIX}/queryCompare\`, method: 'GET', params });
+  },
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, dir, makeRepo(dir));
+      const consumers = contracts.filter((c) => c.role === 'consumer');
+
+      expect(
+        consumers.find((c) => c.contractId === 'http::GET::/b/lowprice/compare_price/querycompare'),
+      ).toBeDefined();
+    });
+
+    it('falls back to {param} when template substitution is non-identifier', async () => {
+      const dir = path.join(tmpDir, 'axios-nonident-template');
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src/api.js'),
+        `
+import axios from 'config/axios.config';
+
+export default {
+  query(cfg) {
+    // member_expression — cannot be statically resolved, falls back to {param}
+    return axios({ url: \`\${cfg.prefix}/queryList\`, method: 'GET' });
+  },
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, dir, makeRepo(dir));
+      const consumers = contracts.filter((c) => c.role === 'consumer');
+
+      // resolveTemplateString returns null for member_expression → unquoteLiteral fallback
+      // → normalizeConsumerPath strips leading {param} segment, leaving just the static suffix
+      expect(
+        consumers.find((c) => c.contractId === 'http::GET::/querylist'),
+      ).toBeDefined();
+      // Original variable name must not leak into the path
+      expect(
+        consumers.find((c) => typeof c.meta.path === 'string' && (c.meta.path as string).includes('cfg')),
+      ).toBeUndefined();
+    });
+
     it('does not emit consumers for unrelated object-literal calls (negative control)', async () => {
       const dir = path.join(tmpDir, 'jquery-axios-negative');
       fs.mkdirSync(path.join(dir, 'public/js'), { recursive: true });

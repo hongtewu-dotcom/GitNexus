@@ -246,6 +246,14 @@ function readStringProp(objectNode: Parser.SyntaxNode, keyNames: readonly string
     if (!keyNode || !valueNode) continue;
     if (!keyNames.includes(keyNode.text)) continue;
     if (valueNode.type !== 'string' && valueNode.type !== 'template_string') continue;
+    if (valueNode.type === 'template_string') {
+      // Try to fully resolve all ${identifier} substitutions first.
+      // If any substitution cannot be resolved (e.g. function parameter),
+      // fall through to unquoteLiteral so the caller's normalizer can
+      // collapse ${...} → {param} as before.
+      const resolved = resolveTemplateString(valueNode);
+      if (resolved !== null) return resolved;
+    }
     const lit = unquoteLiteral(valueNode.text);
     if (lit !== null) return lit;
   }
@@ -627,44 +635,81 @@ function extractTemplateLiteral(node: Parser.SyntaxNode): string | null {
 }
 
 /**
+ * Resolve a template_string node to a concrete path by substituting each
+ * ${identifier} with its intra-scope const/let/var value. Returns null if
+ * any substitution cannot be resolved (caller falls back to unquoteLiteral).
+ *
+ * Handles the common FE pattern:
+ *   const PREFIX = '/b/selfoperator/foo';
+ *   axios({ url: `${PREFIX}/queryList`, method: 'POST' });
+ */
+function resolveTemplateString(templateNode: Parser.SyntaxNode): string | null {
+  let result = '';
+  for (let i = 0; i < templateNode.childCount; i++) {
+    const child = templateNode.child(i);
+    if (!child) continue;
+    if (child.type === 'string_fragment') {
+      result += child.text;
+    } else if (child.type === 'template_substitution') {
+      const expr = child.namedChildCount > 0 ? child.namedChild(0) : null;
+      if (!expr) return null;
+      if (expr.type !== 'identifier') return null;
+      const resolved = resolveVariableInScope(expr.text, expr);
+      if (resolved === null) return null;
+      result += resolved;
+    }
+  }
+  return result.length > 0 ? result : null;
+}
+
+/**
  * Simple intra-scope variable resolution: given `varName` used in a statement
  * at `usageNode`, walk backward through preceding sibling statements in the
  * same block to find `const/let/var varName = <literal>` and return the value.
  * Only resolves one level (no transitive lookups).
  */
 function resolveVariableInScope(varName: string, usageNode: Parser.SyntaxNode): string | null {
-  // Find the statement containing usageNode (walk up to statement_block / program child)
+  // Walk up through enclosing blocks (statement_block, program, class_body),
+  // searching each level for a const/let/var declaration of varName.
+  // This handles the common FE pattern where PREFIX is declared at module level
+  // (program) but used inside a nested method body (statement_block).
   let stmtNode: Parser.SyntaxNode | null = usageNode;
-  while (stmtNode && stmtNode.parent && stmtNode.parent.type !== 'statement_block' && stmtNode.parent.type !== 'program' && stmtNode.parent.type !== 'class_body') {
-    stmtNode = stmtNode.parent;
-  }
-  if (!stmtNode || !stmtNode.parent) return null;
+  while (stmtNode) {
+    // Climb to the direct child of a block-level parent
+    while (stmtNode && stmtNode.parent &&
+      stmtNode.parent.type !== 'statement_block' &&
+      stmtNode.parent.type !== 'program' &&
+      stmtNode.parent.type !== 'class_body') {
+      stmtNode = stmtNode.parent;
+    }
+    if (!stmtNode || !stmtNode.parent) break;
 
-  const block = stmtNode.parent;
-  // Walk backward through children of the block
-  for (let i = 0; i < block.namedChildCount; i++) {
-    const child = block.namedChild(i);
-    if (!child) continue;
-    if (child.id === stmtNode.id) break; // reached our statement, stop looking
-    // Look for variable declarations: lexical_declaration or variable_declaration
-    if (child.type === 'lexical_declaration' || child.type === 'variable_declaration') {
-      // Each declaration can have multiple declarators
-      for (let j = 0; j < child.namedChildCount; j++) {
-        const declarator = child.namedChild(j);
-        if (!declarator || declarator.type !== 'variable_declarator') continue;
-        const nameNode = declarator.childForFieldName('name');
-        const valueNode = declarator.childForFieldName('value');
-        if (!nameNode || !valueNode) continue;
-        if (nameNode.text !== varName) continue;
-        // Found the declaration — extract value
-        if (valueNode.type === 'string') {
-          return unquoteLiteral(valueNode.text);
-        }
-        if (valueNode.type === 'template_string') {
-          return extractTemplateLiteral(valueNode);
+    const block = stmtNode.parent;
+    for (let i = 0; i < block.namedChildCount; i++) {
+      const child = block.namedChild(i);
+      if (!child) continue;
+      if (child.id === stmtNode.id) break; // reached our statement, stop looking forward
+      if (child.type === 'lexical_declaration' || child.type === 'variable_declaration') {
+        for (let j = 0; j < child.namedChildCount; j++) {
+          const declarator = child.namedChild(j);
+          if (!declarator || declarator.type !== 'variable_declarator') continue;
+          const nameNode = declarator.childForFieldName('name');
+          const valueNode = declarator.childForFieldName('value');
+          if (!nameNode || !valueNode) continue;
+          if (nameNode.text !== varName) continue;
+          if (valueNode.type === 'string') {
+            return unquoteLiteral(valueNode.text);
+          }
+          if (valueNode.type === 'template_string') {
+            return extractTemplateLiteral(valueNode);
+          }
         }
       }
     }
+
+    // Not found in this block — climb to the parent block and retry
+    if (block.type === 'program') break; // reached top level, stop
+    stmtNode = block;
   }
   return null;
 }
