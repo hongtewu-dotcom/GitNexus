@@ -5,6 +5,9 @@ export interface FTSIndexDefinition {
 }
 
 export const FTS_INDEXES: readonly FTSIndexDefinition[] = [
-  // FTS disabled — impact/context don't need full-text search.
-  // query tool falls back to exact match when no FTS indexes exist.
+  { table: 'File', indexName: 'file_fts', properties: ['name', 'content'] },
+  { table: 'Function', indexName: 'function_fts', properties: ['name', 'content'] },
+  { table: 'Class', indexName: 'class_fts', properties: ['name', 'content'] },
+  { table: 'Method', indexName: 'method_fts', properties: ['name', 'content'] },
+  { table: 'Interface', indexName: 'interface_fts', properties: ['name', 'content'] },
 ];

@@ -114,9 +114,32 @@ class FileContentCache {
   }
 }
 
-const extractContent = async (_node: GraphNode, _contentCache: FileContentCache): Promise<string> => {
-  // Content omitted to reduce DB size — source code can be read directly from filePath + startLine/endLine
-  return '';
+const extractContent = async (node: GraphNode, contentCache: FileContentCache): Promise<string> => {
+  const filePath = node.properties.filePath;
+  const content = await contentCache.get(filePath);
+  if (!content) return '';
+  if (node.label === 'Folder') return '';
+  if (isBinaryContent(content)) return '[Binary file - content not stored]';
+
+  if (node.label === 'File') {
+    const MAX_FILE_CONTENT = 10000;
+    return content.length > MAX_FILE_CONTENT
+      ? content.slice(0, MAX_FILE_CONTENT) + '\n... [truncated]'
+      : content;
+  }
+
+  const startLine = node.properties.startLine;
+  const endLine = node.properties.endLine;
+  if (startLine === undefined || endLine === undefined) return '';
+
+  const lines = content.split('\n');
+  const start = Math.max(0, startLine - 2);
+  const end = Math.min(lines.length - 1, endLine + 2);
+  const snippet = lines.slice(start, end + 1).join('\n');
+  const MAX_SNIPPET = 5000;
+  return snippet.length > MAX_SNIPPET
+    ? snippet.slice(0, MAX_SNIPPET) + '\n... [truncated]'
+    : snippet;
 };
 
 // ============================================================================
